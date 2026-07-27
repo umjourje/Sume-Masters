@@ -9,6 +9,8 @@ projeto ou exportadas no shell), para não expor pastas de sistema no código:
 
     RAW_ROOT=/caminho/completo/ate/.../Energy-Load-Profiles
     OUT_ROOT=/caminho/completo/ate/a/pasta/de/saida
+    OUT_ROOT_REAL=/.../saida-real         # (opcional) p/ treino multi-fonte
+    WLSTMIX_DIR=/caminho/ate/o/repo/W-LSTMix   # onde estão models/ e my_utils/
 
 RAW_ROOT deve apontar DIRETAMENTE para a pasta que contém as resoluções
 (15min/30min/Hourly) — ex.: .../Energy-Load-Profiles ou
@@ -35,11 +37,22 @@ def _get_path_env(var_name: str) -> Path:
     return Path(val)
 
 
+def _get_path_env_opt(var_name: str) -> Path | None:
+    """Variante OPCIONAL: devolve None se a variável não existir."""
+    val = os.getenv(var_name)
+    return Path(val) if val else None
+
+
 @dataclass
 class PipelineConfig:
     # ---------- Caminhos (obrigatórios, via .env) ----------
     raw_root: Path = field(default_factory=lambda: _get_path_env("RAW_ROOT"))
     out_root: Path = field(default_factory=lambda: _get_path_env("OUT_ROOT"))
+    # OUT_ROOT do dataset REAL (opcional): usado por --data-scope both/real
+    # quando o dataset atual (OUT_ROOT) é o sintético. Se ausente,
+    # --data-scope both/real exige que OUT_ROOT já aponte para o real.
+    out_root_real: Path | None = field(
+        default_factory=lambda: _get_path_env_opt("OUT_ROOT_REAL"))
     resolution: str = "Hourly"                    # "15min" | "30min" | "Hourly"
 
     # ---------- Passo 1: split ----------

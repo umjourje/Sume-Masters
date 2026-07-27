@@ -1,30 +1,63 @@
-"""
-Modelo híbrido: forecasting (W-LSTMix original, congelável/finetunável)
-+ cabeça de classificação por timestep (sua contribuição).
+"""model_hybrid.py — W-LSTMix (backbone ORIGINAL) + cabeça de classificação.
 
-Arquitetura:
-  * backbone = models.W_LSTMix.Model do repo original (inalterado):
-      (trend_input, season_input) -> (trend_pred, season_pred)
-  * head = MLP sobre a concatenação de:
-      [trend_norm, season_norm] do backcast  +  [trend_pred, season_pred]
-    produzindo um logit POR TIMESTEP do horizonte de forecast.
-    Intuição: a previsão do backbone funciona como "modelo do normal";
-    o head aprende a mapear (contexto, previsão) -> probabilidade de anomalia.
+O backbone é a classe Model do repositório W-LSTMix (EdgeIntelligenceLab),
+importada SEM modificação. A pasta 'models/' desse repositório precisa
+estar no sys.path; para não depender do diretório de trabalho, o caminho
+é lido da variável de ambiente WLSTMIX_DIR (definida no .env), com
+fallbacks para layouts comuns.
+
+    WLSTMIX_DIR=/caminho/ate/o/repo/W-LSTMix     # contém models/W_LSTMix.py
 """
 from __future__ import annotations
+import os
 import sys
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-from config import CFG
 
-sys.path.append("./models")            # aponte para a pasta models do W-LSTMix
-from models import W_LSTMix            # noqa: E402  (import do repo original)
+# --- localização robusta do pacote 'models' do repo W-LSTMix ---------------
+_CANDIDATES = []
+_env = os.environ.get("WLSTMIX_DIR")
+if _env:
+    _CANDIDATES += [_env, os.path.join(_env, "W-LSTMix")]
+# fallbacks: mesmo diretório deste arquivo, e um nível acima
+_here = Path(__file__).resolve().parent
+_CANDIDATES += [str(_here), str(_here.parent),
+                str(_here / "W-LSTMix"), str(_here.parent / "W-LSTMix")]
+
+for _c in _CANDIDATES:
+    if _c and (Path(_c) / "models" / "W_LSTMix.py").exists():
+        if _c not in sys.path:
+            sys.path.insert(0, _c)
+        break
+
+try:
+    from models import W_LSTMix          # backbone original, inalterado
+except ModuleNotFoundError as e:         # mensagem acionável
+    raise ModuleNotFoundError(
+        "Não encontrei o pacote 'models' do repositório W-LSTMix. "
+        "Defina WLSTMIX_DIR no .env apontando para a pasta que contém "
+        "models/W_LSTMix.py (ex.: o clone de EdgeIntelligenceLab/W-LSTMix), "
+        f"ou copie models/ e my_utils/ para {_here}. "
+        f"Caminhos testados: {_CANDIDATES}") from e
+
+from config import CFG
 
 
 class HybridWLSTMix(nn.Module):
+    """Backbone de forecasting + cabeça de classificação por timestep.
+
+    forward(trend_in, season_in) -> (trend_pred, season_pred, cls_logits)
+      * trend_pred, season_pred: saídas ORIGINAIS do W-LSTMix (horizonte F);
+      * cls_logits: um logit por passo do horizonte (F,), da cabeça de
+        classificação que recebe a previsão reconstruída + os componentes.
+    """
+
     def __init__(self, device, freeze_backbone: bool = False,
-                 pretrained_path: str | None = None):
+                 pretrained_path=None):
         super().__init__()
+        self.device = device
         self.backbone = W_LSTMix.Model(
             device=device,
             num_blocks_per_stack=CFG.num_blocks_per_stack,
@@ -39,25 +72,24 @@ class HybridWLSTMix(nn.Module):
             ff_hidden_dim=CFG.ff_hidden_dim,
         )
         if pretrained_path:
-            # LINHA CRUCIAL (fine-tuning): carrega os pesos publicados do
-            # W-LSTMix antes de acoplar a cabeça de classificação.
-            self.backbone.load_state_dict(
-                torch.load(pretrained_path, map_location=device), strict=False)
+            # carrega SÓ os pesos do backbone (checkpoint do W-LSTMix puro)
+            state = torch.load(pretrained_path, map_location=device)
+            self.backbone.load_state_dict(state, strict=False)
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
-        in_dim = 2 * CFG.backcast_length + 2 * CFG.forecast_length
-        self.cls_head = nn.Sequential(
-            nn.Linear(in_dim, 256), nn.GELU(), nn.Dropout(0.1),
-            nn.Linear(256, 128), nn.GELU(),
-            # LINHA CRUCIAL: um logit por passo do horizonte -> detecção
-            # de anomalia PONTUAL (por timestep), não por janela inteira.
-            nn.Linear(128, CFG.forecast_length),
+        F = CFG.forecast_length
+        # Cabeça: recebe [trend_pred, season_pred] concatenados (2F) e produz
+        # F logits (um por passo do horizonte). MLP leve, na linha do modelo.
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * F, CFG.ff_hidden_dim),
+            nn.GELU(),
+            nn.Linear(CFG.ff_hidden_dim, F),
         )
 
     def forward(self, trend_in, season_in):
         trend_pred, season_pred = self.backbone(trend_in, season_in)
-        feats = torch.cat([trend_in, season_in, trend_pred, season_pred], dim=-1)
-        logits = self.cls_head(feats)              # (B, forecast_length)
-        return trend_pred, season_pred, logits
+        feats = torch.cat([trend_pred, season_pred], dim=-1)
+        cls_logits = self.classifier(feats)
+        return trend_pred, season_pred, cls_logits
