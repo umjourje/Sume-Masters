@@ -204,6 +204,7 @@ def _read_col(fp: Path, col: str) -> pd.Series:
 
 def _read_cols(fp: Path, cols: list[str]) -> pd.DataFrame:
     """Lê múltiplas colunas com a mesma tolerância a coluna-índice."""
+    cols = [c for c in cols if c is not None]      # defesa: nunca passa None
     df = pd.read_parquet(fp, columns=cols)
     missing = [c for c in cols if c not in df.columns]
     if missing:
@@ -299,14 +300,37 @@ def iter_building_series_file(fp: Path):
             if idcol is None and vcol is None:
                 yield from _iter_wide_columns(fp, tcol, non_time)
                 return
-            if idcol is None and vcol is not None:
+            if vcol is not None and idcol is None:
                 # SINGLE: lê só as colunas necessárias.
                 use = [vcol] + ([tcol] if tcol else [])
                 yield from iter_building_series(_read_cols(fp, use), fp.stem)
                 return
-            # LONG: precisa de id+valor(+tempo) — lê apenas essas colunas.
-            use = [idcol, vcol] + ([tcol] if tcol else [])
-            yield from iter_building_series(_read_cols(fp, use), fp.stem)
+            if idcol is not None and vcol is not None:
+                # LONG: id + valor (+ tempo) — lê apenas essas colunas.
+                use = [idcol, vcol] + ([tcol] if tcol else [])
+                yield from iter_building_series(_read_cols(fp, use), fp.stem)
+                return
+            # AMBÍGUO: achou id mas NÃO achou coluna de valor (idcol!=None,
+            # vcol=None). Antes, isto montava use=[idcol, None, ...] e o None
+            # estourava no pyarrow ("expected bytes, NoneType found").
+            # Estratégia: se, além do id (e do tempo), sobra EXATAMENTE uma
+            # coluna, assume-se que é a medida; caso contrário, cai no leitor
+            # genérico e registra um diagnóstico acionável.
+            leftover = [c for c in non_time if c != idcol]
+            if len(leftover) == 1:
+                use = [idcol, leftover[0]] + ([tcol] if tcol else [])
+                df = _read_cols(fp, use).rename(
+                    columns={leftover[0]: "energy"})
+                yield from iter_building_series(df, fp.stem)
+                return
+            print(f"[step1][AVISO] layout não resolvido em {fp}: "
+                  f"colunas={list(cols)} | id={idcol!r} valor={vcol!r} "
+                  f"tempo={tcol!r}. Lendo o arquivo inteiro como fallback; "
+                  f"se a coluna de medida tiver nome incomum, adicione-o a "
+                  f"VALUE_CANDIDATES.", flush=True)
+            df = _read_any(fp)
+            if df is not None and not df.empty:
+                yield from iter_building_series(df, fp.stem)
             return
     df = _read_any(fp)
     if df is not None and not df.empty:
