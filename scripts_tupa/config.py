@@ -75,6 +75,10 @@ class PipelineConfig:
     # ---------- Treino (passo 6) ----------
     loader_workers: int = 16
     use_amp: bool = True                          # mixed precision no treino
+    # Carga dos shards no passo 6: False=eager (tudo na RAM, rápido,
+    # inviável p/ o sintético inteiro); True=lazy (1 shard por vez,
+    # pico de RAM baixo, use para fontes grandes).
+    lazy_loading: bool = False
 
     # ---------- Passo 2: janelamento ----------
     # ATENÇÃO (resolução): valores em PASSOS. Para "15min", 7 dias = 672,

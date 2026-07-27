@@ -48,6 +48,9 @@ def _speed_setup():
 
 # ============================== TREINO =====================================
 class WindowedPTDataset(Dataset):
+    """Carga EAGER: mantém os tensores do shard vivos na RAM. Rápido para
+    acesso, mas o custo de memória é a soma de TODOS os shards carregados —
+    inviável para o sintético inteiro (bilhões de janelas)."""
     def __init__(self, pt_path):
         pack = torch.load(pt_path, weights_only=False)
         B = CFG.backcast_length
@@ -71,20 +74,80 @@ class WindowedPTDataset(Dataset):
                 "cls_target": self.cls_tg[i]}
 
 
+class LazyWindowedPTDataset(Dataset):
+    """Carga LAZY: lê apenas o CABEÇALHO na construção (nº de janelas,
+    building_idx, starts — baratos) e mantém os tensores pesados fora da
+    RAM até serem pedidos, com um cache de 1 shard. Adequado quando a soma
+    dos shards não cabe em memória; o pico de RAM é o de um shard por
+    worker do DataLoader. As colunas 'group'/'building_idx'/'starts' ficam
+    disponíveis para o rolling-origin sem carregar os pesos."""
+    _cache_path = None
+    _cache = None
+
+    def __init__(self, pt_path):
+        self.path = pt_path
+        self.group = pt_path.stem
+        # Só metadados: carrega uma vez para dimensionar e indexar folds.
+        pack = torch.load(pt_path, weights_only=False, mmap=True)
+        self._n = int(pack["trend_norm"].shape[0])
+        self.building_idx = pack["building_idx"].clone()
+        self.starts = pack["start"].clone()
+        del pack
+
+    def __len__(self):
+        return self._n
+
+    def _load(self):
+        # cache de 1 shard por PROCESSO (compartilhado entre instâncias):
+        if LazyWindowedPTDataset._cache_path != self.path:
+            LazyWindowedPTDataset._cache = torch.load(
+                self.path, weights_only=False)
+            LazyWindowedPTDataset._cache_path = self.path
+        return LazyWindowedPTDataset._cache
+
+    def __getitem__(self, i):
+        pack = self._load()
+        B = CFG.backcast_length
+        return {"trend_input": pack["trend_norm"][i, :B],
+                "season_input": pack["season_norm"][i, :B],
+                "trend_target": pack["trend_norm"][i, B:],
+                "season_target": pack["season_norm"][i, B:],
+                "cls_target": pack["labels_fused"][i, B:].float()}
+
+
 def _windows_root_of(out_root) -> Path:
     """windows_root (02_windows/<res>) para um OUT_ROOT arbitrário."""
     return Path(out_root) / "02_windows" / CFG.resolution
 
 
-def load_split(split: str, out_root=None) -> ConcatDataset:
-    """Carrega os shards de um split. out_root=None usa o dataset corrente
-    (CFG.out_root); passe outro OUT_ROOT para a fonte real/sintética."""
+def load_split(split: str, out_root=None, logger=None) -> ConcatDataset:
+    """Carrega os shards de um split, com PROGRESSO visível. out_root=None
+    usa o dataset corrente (CFG.out_root). O tipo de dataset (eager/lazy)
+    é escolhido por CFG.lazy_loading — lazy evita o estouro de RAM ao
+    carregar fontes grandes (ex.: o sintético inteiro)."""
+    import time as _t
     base = (_windows_root_of(out_root) if out_root is not None
             else CFG.windows_root) / split
-    ds = [WindowedPTDataset(p) for p in sorted(base.rglob("*.pt"))] \
-        if base.exists() else []
-    if not ds:
+    pts = sorted(base.rglob("*.pt")) if base.exists() else []
+    if not pts:
         raise RuntimeError(f"Nenhum .pt em {base} — rode os passos 1-5.")
+    cls = (LazyWindowedPTDataset if getattr(CFG, "lazy_loading", False)
+           else WindowedPTDataset)
+    msg = (f"[step6] carregando {len(pts)} shards de {base} "
+           f"({'LAZY' if cls is LazyWindowedPTDataset else 'EAGER'})...")
+    (logger.term(msg) if logger else print(msg, flush=True))
+    ds, t0, n_win = [], _t.time(), 0
+    for k, p in enumerate(pts, 1):
+        d = cls(p)
+        ds.append(d)
+        n_win += len(d)
+        # LINHA CRUCIAL (visibilidade): progresso + snapshot de recursos a
+        # cada bloco — sem isso o carregamento é totalmente às cegas.
+        if logger and (k % 50 == 0 or k == len(pts)):
+            logger.term(f"[step6]   {k}/{len(pts)} shards | "
+                        f"{n_win:,} janelas | {_fmt_dur(_t.time() - t0)}")
+            logger.snapshot(f"carregando {out_root or 'corrente'} "
+                            f"shard {k}/{len(pts)}")
     return ConcatDataset(ds)
 
 
@@ -258,12 +321,12 @@ def train(pretrained_path=None, freeze_backbone=False, tag="rolling",
 
     # ---- caminho de DOIS ESTÁGIOS: pré-treino no sintético + fine-tune real
     if data_scope == "both" and combine == "pretrain":
-        synth = load_split("train", dict(scopes)["synthetic"])
+        synth = load_split("train", dict(scopes)["synthetic"], logger)
         logger.term(f"[step6] estágio 1/2 (pré-treino sintético): "
                     f"{sum(len(d) for d in synth.datasets):,} janelas")
         fl1, h1 = _fit(synth, model, device, logger, out_dir,
                        CFG.learning_rate, "pretrain")
-        real = load_split("train", dict(scopes)["real"])
+        real = load_split("train", dict(scopes)["real"], logger)
         logger.term(f"[step6] estágio 2/2 (fine-tuning real): "
                     f"{sum(len(d) for d in real.datasets):,} janelas")
         # fine-tuning costuma usar lr menor; CFG.learning_rate/10 é um padrão
@@ -274,7 +337,7 @@ def train(pretrained_path=None, freeze_backbone=False, tag="rolling",
         # ---- caminho de ESTÁGIO ÚNICO (synthetic | real | both:pool/reweight)
         datasets = []
         for name, root in scopes:
-            d = load_split("train", root)
+            d = load_split("train", root, logger)
             datasets.append((name, d))
             logger.term(f"[step6] fonte '{name}': "
                         f"{sum(len(x) for x in d.datasets):,} janelas")
