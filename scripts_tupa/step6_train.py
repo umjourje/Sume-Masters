@@ -35,9 +35,9 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
 from config import CFG
 from perf_log import RunLogger, _fmt_dur
 from model_hybrid import HybridWLSTMix
-from step2_3_windows_wavelet_v2 import (make_windows, decompose_windows_batch,
+from step2_3_windows_wavelet import (make_windows, decompose_windows_batch,
                                      standardize_batch)
-from step4_5_labels_v2 import label_windows_batch, fuse_labels
+from step4_5_labels import label_windows_batch, fuse_labels
 
 
 def _speed_setup():
@@ -249,6 +249,150 @@ def run_epoch(model, loader, mse, bce, device, scaler, optimizer=None):
     return tot / max(n, 1)
 
 
+def _discover_shards(out_root, split="train"):
+    """Lista (grupo, caminho) dos shards de uma fonte, sem carregá-los."""
+    base = _windows_root_of(out_root) / split
+    if not base.exists():
+        raise RuntimeError(f"Nenhum shard em {base} — rode os passos 1-5.")
+    pts = sorted(base.rglob("*.pt"))
+    # grupo = diretório-pai relativo (para amostragem estratificada)
+    return [(str(p.parent.relative_to(base)), p) for p in pts]
+
+
+def _sample_shards(shards, max_shards, seed=None):
+    """Amostra ESTRATIFICADA por grupo: distribui max_shards proporcional-
+    mente ao tamanho de cada grupo, preservando a diversidade de fontes
+    (estados/datasets) em vez de pegar só os primeiros alfabeticamente."""
+    if max_shards <= 0 or len(shards) <= max_shards:
+        return shards
+    import numpy as _np
+    from collections import defaultdict
+    by_group = defaultdict(list)
+    for g, p in shards:
+        by_group[g].append(p)
+    rng = _np.random.default_rng(seed if seed is not None else CFG.seed)
+    total = len(shards)
+    picked = []
+    for g, ps in by_group.items():
+        quota = max(1, round(max_shards * len(ps) / total))
+        idx = rng.choice(len(ps), min(quota, len(ps)), replace=False)
+        picked += [(g, ps[i]) for i in sorted(idx.tolist())]
+    # ajuste fino para não exceder muito o alvo
+    if len(picked) > max_shards:
+        idx = rng.choice(len(picked), max_shards, replace=False)
+        picked = [picked[i] for i in sorted(idx.tolist())]
+    return picked
+
+
+class ShardTemporalDataset(Dataset):
+    """Um único shard, com split TEMPORAL por prédio: reserva a fração
+    final (mais recente) das janelas de cada prédio para validação. É a
+    substituição do rolling-origin global no v0 — 'valida no futuro,
+    treina no passado' sem varredura global de todos os shards."""
+    def __init__(self, pt_path, part, val_frac):
+        pack = torch.load(pt_path, weights_only=False)
+        B = CFG.backcast_length
+        starts = pack["start"].numpy()
+        b_idx = pack["building_idx"].numpy()
+        # Para cada prédio, ordena as janelas por 'start' e separa a cauda.
+        import numpy as _np
+        tr_mask = _np.ones(len(starts), dtype=bool)
+        for bi in _np.unique(b_idx):
+            w = _np.where(b_idx == bi)[0]
+            order = w[_np.argsort(starts[w])]
+            n_val = max(1, int(len(order) * val_frac))
+            (tr_mask.__setitem__(order[-n_val:], False) if part == "train"
+             else None)
+            if part == "val":
+                tr_mask[order[:-n_val]] = False   # mantém só a cauda
+        keep = _np.where(tr_mask)[0] if part == "train" \
+            else _np.where(~tr_mask)[0]
+        self.ti = pack["trend_norm"][keep, :B]
+        self.si = pack["season_norm"][keep, :B]
+        self.tt = pack["trend_norm"][keep, B:]
+        self.st = pack["season_norm"][keep, B:]
+        self.ct = pack["labels_fused"][keep, B:].float()
+
+    def __len__(self):
+        return self.ti.shape[0]
+
+    def __getitem__(self, i):
+        return {"trend_input": self.ti[i], "season_input": self.si[i],
+                "trend_target": self.tt[i], "season_target": self.st[i],
+                "cls_target": self.ct[i]}
+
+
+def _estimate_pos_weight(shard_paths, device, k=8):
+    """pos_weight a partir de uma amostra de shards (não do dataset todo)."""
+    import numpy as _np
+    pos = tot = 0
+    for p in shard_paths[:k]:
+        pack = torch.load(p, weights_only=False)
+        y = pack["labels_fused"][:, CFG.backcast_length:].numpy()
+        pos += int(y.sum()); tot += int(y.size)
+    pos = max(pos, 1)
+    return torch.tensor((tot - pos) / pos, dtype=torch.float32, device=device)
+
+
+def _fit_scale(shard_list, model, device, logger, out_dir, lr, tag_stage):
+    """Treino em ESCALA por STREAMING de shards: processa um shard por vez
+    (RAM = 1 shard), com validação temporal intra-shard e early stopping
+    sobre a perda de validação média por época. Usado para o v0 sintético
+    (amostra de shards ou todos), evitando materializar o dataset."""
+    opt = torch.optim.Adam(filter(lambda p: p.requires_grad,
+                                  model.parameters()), lr=lr)
+    scaler = torch.amp.GradScaler(enabled=CFG.use_amp and
+                                  device.type == "cuda")
+    mse = torch.nn.MSELoss()
+    bce = torch.nn.BCEWithLogitsLoss(
+        pos_weight=_estimate_pos_weight([p for _, p in shard_list], device))
+    paths = [p for _, p in shard_list]
+    import numpy as _np
+    rng = _np.random.default_rng(CFG.seed)
+    history, best, wait = [], float("inf"), 0
+    for ep in range(CFG.epochs_scale):
+        t_e = time.time()
+        order = rng.permutation(len(paths))        # embaralha ORDEM dos shards
+        tr_sum = va_sum = tr_n = va_n = 0
+        for si, k in enumerate(order, 1):
+            p = paths[k]
+            tr_ds = ShardTemporalDataset(p, "train", CFG.val_frac_per_shard)
+            va_ds = ShardTemporalDataset(p, "val", CFG.val_frac_per_shard)
+            if len(tr_ds):
+                tl = _loader(tr_ds, True)
+                tr = run_epoch(model, tl, mse, bce, device, scaler, opt)
+                tr_sum += tr * len(tr_ds); tr_n += len(tr_ds)
+            if len(va_ds):
+                vl = _loader(va_ds, False)
+                va = run_epoch(model, vl, mse, bce, device, scaler)
+                va_sum += va * len(va_ds); va_n += len(va_ds)
+            if si % 25 == 0 or si == len(order):
+                logger.term(f"[step6:{tag_stage}] ep {ep+1}/{CFG.epochs_scale} "
+                            f"shard {si}/{len(order)} | "
+                            f"train={tr_sum/max(tr_n,1):.4f} "
+                            f"val={va_sum/max(va_n,1):.4f} "
+                            f"({_fmt_dur(time.time()-t_e)})")
+                logger.snapshot(f"{tag_stage}_ep{ep}_shard{si}")
+        va_epoch = va_sum / max(va_n, 1)
+        history.append({"stage": tag_stage, "epoch": ep,
+                        "train": tr_sum/max(tr_n,1), "val": va_epoch})
+        logger.term(f"[step6:{tag_stage}] === época {ep+1} completa: "
+                    f"val={va_epoch:.4f} ===")
+        if va_epoch < best:
+            best, wait = va_epoch, 0
+            tmp = out_dir / f"best_{tag_stage}.pth.tmp"
+            torch.save(model.state_dict(), tmp)
+            tmp.replace(out_dir / f"best_{tag_stage}.pth")
+        else:
+            wait += 1
+            if wait >= CFG.patience:
+                logger.term(f"[step6:{tag_stage}] early stopping (época {ep+1})")
+                break
+    model.load_state_dict(torch.load(out_dir / f"best_{tag_stage}.pth",
+                                     map_location=device))
+    return [best], history
+
+
 def _fit(full, model, device, logger, out_dir, lr, tag_stage):
     """Executa o rolling-origin sobre um ConcatDataset `full`, treinando
     `model` (que pode já vir pré-treinado). Retorna as perdas por fold.
@@ -294,78 +438,84 @@ def _fit(full, model, device, logger, out_dir, lr, tag_stage):
 
 
 def train(pretrained_path=None, freeze_backbone=False, tag="rolling",
-          data_scope="synthetic", combine="pretrain"):
+          data_scope="synthetic", combine="pretrain", max_shards=None):
     """Treina um v0.
 
-    --data-scope:
-        synthetic : só o dataset corrente (OUT_ROOT)
-        real      : só o real (OUT_ROOT_REAL, ou OUT_ROOT se ausente)
-        both      : sintético + real, combinados conforme --combine
-    --combine (só relevante p/ both):
-        pretrain  : treina no sintético e DEPOIS faz fine-tuning no real
-                    (dois estágios; recomendado p/ a comparação metodológica)
-        pool      : junta os shards das duas fontes num só treino
-        reweight  : pool, mas equalizando o nº de janelas das duas fontes
+    ESTRATÉGIA DE ESCALA (decisão de projeto):
+      * fonte SINTÉTICA -> treino por STREAMING de shards (RAM = 1 shard),
+        com amostragem estratificada (CFG.max_shards; 0 = todos) e
+        validação temporal intra-shard. Evita materializar o dataset
+        (que exigiria ~TB de RAM).
+      * fonte REAL -> carga eager + rolling-origin completo (é pequena, e
+        é onde o rigor de validação temporal importa para o artigo).
+
+    --data-scope: synthetic | real | both
+    --combine (both): pretrain (pré-treino sintético streaming + fine-tune
+        real rolling-origin; RECOMENDADO) | pool | reweight
     """
     logger = RunLogger("step6_train")
     _speed_setup()
     torch.manual_seed(CFG.seed)
+    if max_shards is not None:
+        CFG.max_shards = max_shards
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.term(f"[step6] device={device} amp={CFG.use_amp} "
                 f"scope={data_scope} combine={combine} "
-                f"batch={CFG.batch_size}")
+                f"batch={CFG.batch_size} max_shards={CFG.max_shards}")
     scopes = _resolve_scopes(data_scope)
     out_dir = CFG.models_root / tag
     out_dir.mkdir(parents=True, exist_ok=True)
     model = HybridWLSTMix(device, freeze_backbone, pretrained_path).to(device)
 
-    # ---- caminho de DOIS ESTÁGIOS: pré-treino no sintético + fine-tune real
-    if data_scope == "both" and combine == "pretrain":
-        synth = load_split("train", dict(scopes)["synthetic"], logger)
-        logger.term(f"[step6] estágio 1/2 (pré-treino sintético): "
-                    f"{sum(len(d) for d in synth.datasets):,} janelas")
-        fl1, h1 = _fit(synth, model, device, logger, out_dir,
-                       CFG.learning_rate, "pretrain")
-        real = load_split("train", dict(scopes)["real"], logger)
-        logger.term(f"[step6] estágio 2/2 (fine-tuning real): "
-                    f"{sum(len(d) for d in real.datasets):,} janelas")
-        # fine-tuning costuma usar lr menor; CFG.learning_rate/10 é um padrão
-        fl2, h2 = _fit(real, model, device, logger, out_dir,
-                       CFG.learning_rate / 10, "finetune")
-        fold_losses, history = fl2, h1 + h2
-    else:
-        # ---- caminho de ESTÁGIO ÚNICO (synthetic | real | both:pool/reweight)
-        datasets = []
-        for name, root in scopes:
-            d = load_split("train", root, logger)
-            datasets.append((name, d))
-            logger.term(f"[step6] fonte '{name}': "
-                        f"{sum(len(x) for x in d.datasets):,} janelas")
-        if combine == "reweight" and len(datasets) > 1:
-            # equaliza por subamostragem da fonte maior (determinística)
-            import numpy as _np
-            sizes = [len(d) for _, d in datasets]
-            target = min(sizes)
-            balanced = []
-            for (_, d), sz in zip(datasets, sizes):
-                if sz > target:
-                    g = _np.random.default_rng(CFG.seed)
-                    idx = sorted(g.choice(sz, target, replace=False).tolist())
-                    balanced.append(Subset(d, idx))
-                else:
-                    balanced.append(d)
-            full = ConcatDataset(balanced)
-        else:
-            full = ConcatDataset([d for _, d in datasets])
-        logger.term(f"[step6] treino combinado: "
-                    f"{len(full):,} janelas")
-        fold_losses, history = _fit(full, model, device, logger, out_dir,
-                                    CFG.learning_rate, "rolling")
+    def _train_synthetic(root, stage):
+        shards = _discover_shards(root)
+        sampled = _sample_shards(shards, CFG.max_shards)
+        logger.term(f"[step6] {stage}: {len(sampled)}/{len(shards)} shards "
+                    f"(amostra estratificada; streaming, RAM=1 shard)")
+        return _fit_scale(sampled, model, device, logger, out_dir,
+                          CFG.learning_rate, stage)
 
-    torch.save(model.state_dict(), out_dir / "best_model.pth")
+    def _train_real(root, stage, lr):
+        real = load_split("train", root, logger)     # real cabe eager
+        logger.term(f"[step6] {stage}: "
+                    f"{sum(len(d) for d in real.datasets):,} janelas "
+                    f"(rolling-origin completo)")
+        return _fit(real, model, device, logger, out_dir, lr, stage)
+
+    # ---- RECOMENDADO: pré-treino sintético (streaming) + fine-tune real ----
+    if data_scope == "both" and combine == "pretrain":
+        _, h1 = _train_synthetic(dict(scopes)["synthetic"], "pretrain")
+        fl2, h2 = _train_real(dict(scopes)["real"], "finetune",
+                              CFG.learning_rate / 10)
+        fold_losses, history = fl2, h1 + h2
+    elif data_scope == "synthetic":
+        fold_losses, history = _train_synthetic(dict(scopes)["synthetic"],
+                                                "rolling")
+    elif data_scope == "real":
+        fold_losses, history = _train_real(dict(scopes)["real"], "rolling",
+                                           CFG.learning_rate)
+    else:
+        # both + pool/reweight: streaming das duas fontes concatenadas.
+        # (pool materializava tudo -> estouro; agora ambas em streaming.)
+        s_syn = _sample_shards(_discover_shards(dict(scopes)["synthetic"]),
+                               CFG.max_shards)
+        s_real = _discover_shards(dict(scopes)["real"])
+        if combine == "reweight":
+            # equaliza nº de shards entre as fontes
+            n = min(len(s_syn), len(s_real))
+            s_syn, s_real = s_syn[:n], s_real[:n]
+        logger.term(f"[step6] pool streaming: {len(s_syn)} sint + "
+                    f"{len(s_real)} real shards")
+        fold_losses, history = _fit_scale(s_syn + s_real, model, device,
+                                          logger, out_dir,
+                                          CFG.learning_rate, "rolling")
+
+    tmp = out_dir / "best_model.pth.tmp"
+    torch.save(model.state_dict(), tmp)
+    tmp.replace(out_dir / "best_model.pth")
     (out_dir / "rolling_results.json").write_text(json.dumps(
         {"data_scope": data_scope, "combine": combine,
-         "fold_val_losses": fold_losses,
+         "max_shards": CFG.max_shards, "val_losses": fold_losses,
          "mean": float(np.mean(fold_losses)),
          "std": float(np.std(fold_losses)), "history": history}, indent=2))
     logger.term(f"[step6] FIM treino ({data_scope}/{combine}): "
@@ -488,11 +638,17 @@ if __name__ == "__main__":
     ap.add_argument("--tag", type=str, default="rolling",
                     help="subpasta de saída em 04_models/ (ex.: v0_both, "
                          "v0_real) — separe os dois v0 da comparação")
+    ap.add_argument("--max-shards", type=int, default=None,
+                    help="nº de shards do sintético a amostrar (estratificado "
+                         "por grupo). 0 = todos via streaming. Sobrescreve "
+                         "CFG.max_shards. Comece pequeno (ex.: 50) para um "
+                         "v0 rápido e valide o pipeline ponta a ponta.")
     a = ap.parse_args()
     if a.mode == "train":
         train(pretrained_path=a.pretrained,
               freeze_backbone=a.freeze_backbone,
-              tag=a.tag, data_scope=a.data_scope, combine=a.combine)
+              tag=a.tag, data_scope=a.data_scope, combine=a.combine,
+              max_shards=a.max_shards)
     else:
         if a.data is None:
             ap.error("--mode test exige --data")

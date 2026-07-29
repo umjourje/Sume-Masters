@@ -112,6 +112,15 @@ class PipelineConfig:
     train_span_steps: int = 24 * 90               # tamanho fixo do treino se "sliding"
     warm_start: bool = True                       # continua o mesmo modelo entre folds
     epochs_per_fold: int = 10                     # épocas máximas por fold
+    # ---------- Treino em escala (v0 sobre o sintético gigante) ----------
+    # Amostragem de shards: 0 = todos (streaming shard-a-shard, RAM baixa);
+    # N > 0 = amostra estratificada de N shards por grupo/fonte (eager).
+    max_shards: int = 200
+    # Validação temporal por shard (substitui o rolling-origin global no v0):
+    # fração FINAL das janelas de cada shard reservada para validação.
+    val_frac_per_shard: float = 0.15
+    # nº de épocas no modo escala (streaming/amostra), com early stopping.
+    epochs_scale: int = 5
     batch_size: int = 512
     patience: int = 3                             # early stopping por fold
     learning_rate: float = 1e-3
