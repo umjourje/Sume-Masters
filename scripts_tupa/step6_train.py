@@ -35,9 +35,9 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
 from config import CFG
 from perf_log import RunLogger, _fmt_dur
 from model_hybrid import HybridWLSTMix
-from step2_3_windows_wavelet import (make_windows, decompose_windows_batch,
+from step2_3_windows_wavelet_v2 import (make_windows, decompose_windows_batch,
                                      standardize_batch)
-from step4_5_labels import label_windows_batch, fuse_labels
+from step4_5_labels_v2 import label_windows_batch, fuse_labels
 
 
 def _speed_setup():
