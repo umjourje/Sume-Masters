@@ -58,13 +58,29 @@ class HybridWLSTMix(nn.Module):
                  pretrained_path=None):
         super().__init__()
         self.device = device
+        # RESTRIÇÃO do backbone: o forward faz
+        # x.view(batch, backcast_length // embed_dim, embed_dim), então
+        # embed_dim TEM de dividir backcast_length. Falhar aqui, com
+        # mensagem clara, é muito melhor que o RuntimeError obscuro
+        # "shape '[B, k, e]' is invalid for input of size ..." lá dentro.
+        if CFG.backcast_length % CFG.embed_dim != 0:
+            raise ValueError(
+                f"embed_dim ({CFG.embed_dim}) precisa DIVIDIR backcast_length "
+                f"({CFG.backcast_length}); caso contrário o reshape interno "
+                f"do W-LSTMix trunca ({CFG.backcast_length}//{CFG.embed_dim}"
+                f"={CFG.backcast_length // CFG.embed_dim}, "
+                f"{CFG.backcast_length // CFG.embed_dim * CFG.embed_dim}"
+                f"!={CFG.backcast_length}). Ajuste embed_dim em config.py "
+                f"para um divisor de {CFG.backcast_length} "
+                f"(ex.: 8 -> 21 patches).")
         self.backbone = W_LSTMix.Model(
             device=device,
             num_blocks_per_stack=CFG.num_blocks_per_stack,
             forecast_length=CFG.forecast_length,
             backcast_length=CFG.backcast_length,
             patch_size=CFG.patch_size,
-            num_patches=CFG.backcast_length // CFG.patch_size,
+            num_patches=getattr(CFG, "num_patches",
+                                CFG.backcast_length // CFG.patch_size),
             thetas_dim=CFG.thetas_dim,
             hidden_dim=CFG.hidden_dim,
             embed_dim=CFG.embed_dim,

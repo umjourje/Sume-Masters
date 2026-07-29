@@ -127,14 +127,20 @@ class PipelineConfig:
     lambda_cls: float = 1.0                       # peso da perda de classificação
     seed: int = 42
 
-    # Hiperparâmetros do backbone (espelham configs/W_LSTMix.json do repo original)
-    num_blocks_per_stack: int = 1
-    patch_size: int = 24
-    thetas_dim: int = 32
-    hidden_dim: int = 64
-    embed_dim: int = 32
-    num_heads: int = 4
-    ff_hidden_dim: int = 64
+    # Hiperparâmetros do backbone — DEVEM espelhar os defaults reais de
+    # W_LSTMix.Model (models/W_LSTMix.py). RESTRIÇÃO CRÍTICA: embed_dim tem
+    # de DIVIDIR backcast_length, pois o forward faz
+    # x.view(batch, backcast_length // embed_dim, embed_dim). Com
+    # backcast=168, embed_dim=8 -> 21 patches exatos (168 = 21*8). Valores
+    # que não dividem 168 quebram o modelo (ex.: 32 -> 168//32=5, 5*32=160).
+    num_blocks_per_stack: int = 3
+    patch_size: int = 8
+    num_patches: int = 21                         # backcast_length // patch_size
+    thetas_dim: int = 8
+    hidden_dim: int = 256
+    embed_dim: int = 8                            # DIVISOR de backcast_length
+    num_heads: int = 2
+    ff_hidden_dim: int = 256
 
     splits: tuple = ("train", "test")
     sectors: tuple = ("Commercial", "Residential")
