@@ -270,11 +270,94 @@ def _speed_setup():
         pass
 
 
-def _loader(ds, shuffle):
+def _speed_setup():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    # CORREÇÃO (Too many open files): sob num_workers>0, o PyTorch
+    # compartilha tensores entre processos via file descriptors por padrão
+    # ('file_descriptor'); com muitos shards/tensores isso estoura o limite
+    # de FDs. 'file_system' usa nomes em /dev/shm e não consome 1 FD por
+    # tensor. Além disso, elevamos o soft-limit de FDs quando possível.
+    try:
+        torch.multiprocessing.set_sharing_strategy("file_system")
+    except Exception:
+        pass
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except Exception:
+        pass
+
+
+def _shm_free_gb() -> float | None:
+    """Espaço livre em /dev/shm (tmpfs) — teto real da estratégia
+    'file_system'. Em containers Docker sem --shm-size explícito, este
+    valor é tipicamente 64 MB, MUITO menor que a RAM da máquina."""
+    try:
+        import shutil as _sh
+        return _sh.disk_usage("/dev/shm").free / 2**30
+    except Exception:
+        return None
+
+
+_SAFE_WORKERS_CACHE = None   # calculado 1x por processo (evita spam de log)
+
+
+def _safe_loader_workers(logger=None) -> int:
+    """Escolhe nº de workers/prefetch que CABEM no /dev/shm disponível,
+    em vez de usar CFG.loader_workers fixo e estourar 'No space left on
+    device' (ENOSPC) — sintoma que NÃO é falta de RAM, é teto de tmpfs.
+    Cacheado: a detecção roda uma única vez por processo."""
+    global _SAFE_WORKERS_CACHE
+    if _SAFE_WORKERS_CACHE is not None:
+        return _SAFE_WORKERS_CACHE
+    free = _shm_free_gb()
+    msg = (f"[step6] /dev/shm livre: {free:.2f}G" if free is not None
+          else "[step6] /dev/shm não detectável (SO não-Linux?)")
+    (logger.term(msg) if logger else print(msg, flush=True))
+    if free is None:
+        _SAFE_WORKERS_CACHE = CFG.loader_workers
+        return _SAFE_WORKERS_CACHE
+    if free < 1.0:
+        # Teto minúsculo (ex.: container com --shm-size padrão de 64MB):
+        # workers=0 evita QUALQUER alocação em /dev/shm (carga no processo
+        # principal, sem IPC). Mais lento, mas não quebra.
+        w = 0
+        msg = (f"[step6][AVISO] /dev/shm muito pequeno ({free:.2f}G) — "
+              f"usando loader_workers=0 (sem multiprocessamento no "
+              f"DataLoader). Para acelerar: aumente /dev/shm (Docker: "
+              f"--shm-size=8g na criação do container; bare metal: "
+              f"'mount -o remount,size=8G /dev/shm', requer root).")
+    elif free < 4.0:
+        w = min(CFG.loader_workers, 2)
+        msg = (f"[step6][AVISO] /dev/shm limitado ({free:.2f}G) — "
+              f"reduzindo loader_workers para {w}.")
+    else:
+        w = CFG.loader_workers
+        msg = f"[step6] /dev/shm suficiente — loader_workers={w}."
+    (logger.term(msg) if logger else print(msg, flush=True))
+    _SAFE_WORKERS_CACHE = w
+    return w
+
+
+def _loader(ds, shuffle, logger=None, force_workers0=False):
+    # force_workers0=True: usado no STREAMING por shard (_fit_scale), onde
+    # um DataLoader é criado A CADA shard (centenas de vezes por época).
+    # Sob a estratégia 'file_system', cada DataLoader com workers>0 grava
+    # tensores como arquivos em /dev/shm; recriar o loader repetidamente
+    # deixa esses arquivos acumularem mais rápido do que são liberados —
+    # um vazamento de RAM (via tmpfs) que NÃO aparece no RSS do processo
+    # principal (diagnosticado por RAM_disp caindo enquanto RSS fica
+    # plano). Como o dado do shard já está inteiro em RAM (carregado no
+    # __init__ do dataset), workers de IPC não trazem ganho real aqui —
+    # zerá-los elimina o vazamento sem custo de desempenho perceptível.
+    w = 0 if force_workers0 else _safe_loader_workers(logger)
     return DataLoader(ds, batch_size=CFG.batch_size, shuffle=shuffle,
-                      num_workers=CFG.loader_workers, pin_memory=True,
-                      persistent_workers=CFG.loader_workers > 0,
-                      prefetch_factor=4 if CFG.loader_workers > 0 else None)
+                      num_workers=w, pin_memory=True,
+                      persistent_workers=w > 0,
+                      prefetch_factor=2 if w > 0 else None)
 
 
 def run_epoch(model, loader, mse, bce, device, scaler, optimizer=None):
@@ -419,11 +502,11 @@ def _fit_scale(shard_list, model, device, logger, out_dir, lr, tag_stage):
             tr_ds = ShardTemporalDataset(p, "train", CFG.val_frac_per_shard)
             va_ds = ShardTemporalDataset(p, "val", CFG.val_frac_per_shard)
             if len(tr_ds):
-                tl = _loader(tr_ds, True)
+                tl = _loader(tr_ds, True, logger, force_workers0=True)
                 tr = run_epoch(model, tl, mse, bce, device, scaler, opt)
                 tr_sum += tr * len(tr_ds); tr_n += len(tr_ds)
             if len(va_ds):
-                vl = _loader(va_ds, False)
+                vl = _loader(va_ds, False, logger, force_workers0=True)
                 va = run_epoch(model, vl, mse, bce, device, scaler)
                 va_sum += va * len(va_ds); va_n += len(va_ds)
             if si % 25 == 0 or si == len(order):
@@ -464,8 +547,8 @@ def _fit(full, model, device, logger, out_dir, lr, tag_stage):
                                   device.type == "cuda")
     fold_losses, history = [], []
     for j, (tr_idx, va_idx) in enumerate(folds):
-        tl = _loader(Subset(full, tr_idx), True)
-        vl = _loader(Subset(full, va_idx), False)
+        tl = _loader(Subset(full, tr_idx), True, logger)
+        vl = _loader(Subset(full, va_idx), False, logger)
         sample = tr_idx[:200_000]
         ys = torch.stack([full[i]["cls_target"] for i in sample]).flatten()
         pos = ys.sum().clamp(min=1.0)
