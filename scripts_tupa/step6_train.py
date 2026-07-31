@@ -35,9 +35,9 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
 from config import CFG
 from perf_log import RunLogger, _fmt_dur
 from model_hybrid import HybridWLSTMix
-from step2_3_windows_wavelet_v2 import (make_windows, decompose_windows_batch,
+from step2_3_windows_wavelet import (make_windows, decompose_windows_batch,
                                      standardize_batch)
-from step4_5_labels_v2 import label_windows_batch, fuse_labels
+from step4_5_labels import label_windows_batch, fuse_labels
 
 
 def _speed_setup():
@@ -174,40 +174,100 @@ def _resolve_scopes(data_scope: str):
     raise ValueError(data_scope)
 
 
-def rolling_origin_folds(full: ConcatDataset):
-    from collections import defaultdict
+def rolling_origin_folds(full: ConcatDataset, logger=None):
+    """VETORIZADO (numpy): o laço original percorria 1 janela por vez em
+    Python puro para indexar por prédio — inviável acima de dezenas de
+    milhões de janelas (era um ponto CEGO: sem log, parecia travado).
+    Aqui, building_idx/starts de cada shard viram arrays numpy e o
+    agrupamento por prédio usa np.unique + máscaras vetorizadas."""
+    import time as _t
+    import numpy as _np
     B, F = CFG.backcast_length, CFG.forecast_length
     day = CFG.val_horizon_steps
-    per_building = defaultdict(list)
-    offset = 0
-    for ds in full.datasets:
-        for i in range(len(ds)):
-            key = f"{ds.group}:{int(ds.building_idx[i])}"
-            per_building[key].append((offset + i, int(ds.starts[i])))
-        offset += len(ds)
+    t0 = _t.time()
+    msg = f"[step6] indexando {len(full):,} janelas por prédio..."
+    (logger.term(msg) if logger else print(msg, flush=True))
+
+    # 1) Concatena (chave_prédio_global, start) de TODOS os shards de uma vez.
+    keys, starts, offset = [], [], 0
+    for k, ds in enumerate(full.datasets):
+        n = len(ds)
+        b = _np.asarray(ds.building_idx)
+        # chave numérica única por prédio: (índice do shard) * 1e6 + building_idx
+        keys.append(k * 1_000_000 + b.astype(_np.int64))
+        starts.append(_np.asarray(ds.starts, dtype=_np.int64))
+        offset += n
+        if logger and (k + 1) % 200 == 0:
+            logger.term(f"[step6]   {k+1}/{len(full.datasets)} shards "
+                        f"indexados ({_fmt_dur(_t.time()-t0)})")
+    keys = _np.concatenate(keys)
+    starts = _np.concatenate(starts)
+    gidx = _np.arange(len(keys))                 # índice global (posição no ConcatDataset)
+    msg = (f"[step6] índice pronto: {len(_np.unique(keys)):,} prédios, "
+          f"{_fmt_dur(_t.time()-t0)}")
+    (logger.term(msg) if logger else print(msg, flush=True))
+
+    # 2) Fim de série por prédio (vetorizado via redução por grupo ordenado).
+    order = _np.argsort(keys, kind="stable")
+    keys_s, starts_s, gidx_s = keys[order], starts[order], gidx[order]
+    uniq, first_idx, counts = _np.unique(keys_s, return_index=True,
+                                         return_counts=True)
+    last_idx = first_idx + counts - 1
+    # 'end' de cada grupo = max(start) do grupo + B + F (starts_s já ordenado
+    # DENTRO do grupo não é garantido; usamos max explícito por segurança).
+    series_end = _np.empty(len(uniq), dtype=_np.int64)
+    for gi in range(len(uniq)):
+        seg = starts_s[first_idx[gi]: last_idx[gi] + 1]
+        series_end[gi] = seg.max() + B + F
+    key_to_end = dict(zip(uniq.tolist(), series_end.tolist()))
+    end_per_window = _np.array([key_to_end[k] for k in keys], dtype=_np.int64)
+
+    # 3) Folds: cutoff por prédio (vetorizado), máscaras booleanas globais.
+    c0 = (end_per_window * CFG.initial_train_frac).astype(_np.int64)
+    c0 -= c0 % CFG.stride
+    win_end = starts + B + F
     folds = []
     for j in range(CFG.n_rolling_folds):
-        tr, va = [], []
-        for key, wins in per_building.items():
-            series_end = max(st for _, st in wins) + B + F
-            c0 = int(series_end * CFG.initial_train_frac)
-            c0 -= c0 % CFG.stride
-            cutoff = c0 + j * day
-            for gi, st in wins:
-                end = st + B + F
-                if CFG.rolling_mode == "sliding":
-                    in_train = end <= cutoff and st >= cutoff - CFG.train_span_steps
-                else:
-                    in_train = end <= cutoff
-                if in_train:
-                    tr.append(gi)
-                elif st + B >= cutoff and end <= cutoff + day:
-                    va.append(gi)
+        cutoff = c0 + j * day
+        if CFG.rolling_mode == "sliding":
+            train_mask = (win_end <= cutoff) & (
+                starts >= cutoff - CFG.train_span_steps)
+        else:
+            train_mask = win_end <= cutoff
+        val_mask = (starts + B >= cutoff) & (win_end <= cutoff + day)
+        tr = gidx[train_mask].tolist()
+        va = gidx[val_mask].tolist()
+        if logger:
+            logger.term(f"[step6]   fold {j+1}/{CFG.n_rolling_folds}: "
+                        f"{len(tr):,} treino, {len(va):,} val")
         if tr and va:
             folds.append((tr, va))
     if not folds:
         raise RuntimeError("Nenhum fold viável — ajuste initial_train_frac.")
+    msg = f"[step6] {len(folds)} fold(s) prontos em {_fmt_dur(_t.time()-t0)}"
+    (logger.term(msg) if logger else print(msg, flush=True))
     return folds
+
+
+def _speed_setup():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    # CORREÇÃO (Too many open files): sob num_workers>0, o PyTorch
+    # compartilha tensores entre processos via file descriptors por padrão
+    # ('file_descriptor'); com muitos shards/tensores isso estoura o limite
+    # de FDs. 'file_system' usa nomes em /dev/shm e não consome 1 FD por
+    # tensor. Além disso, elevamos o soft-limit de FDs quando possível.
+    try:
+        torch.multiprocessing.set_sharing_strategy("file_system")
+    except Exception:
+        pass
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except Exception:
+        pass
 
 
 def _loader(ds, shuffle):
@@ -397,7 +457,7 @@ def _fit(full, model, device, logger, out_dir, lr, tag_stage):
     """Executa o rolling-origin sobre um ConcatDataset `full`, treinando
     `model` (que pode já vir pré-treinado). Retorna as perdas por fold.
     Fatorado de train() para permitir ESTÁGIOS (pré-treino -> fine-tuning)."""
-    folds = rolling_origin_folds(full)
+    folds = rolling_origin_folds(full, logger)
     opt = torch.optim.Adam(filter(lambda p: p.requires_grad,
                                   model.parameters()), lr=lr)
     scaler = torch.amp.GradScaler(enabled=CFG.use_amp and
