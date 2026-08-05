@@ -54,6 +54,57 @@ _RE_PROGRESS = re.compile(
     r"shard (?P<sh>\d+)/(?P<shn>\d+) \| train=[\d.]+ val=[\d.]+ "
     r"\((?P<el>[^,]+),")
 
+_RE_FOLD = re.compile(
+    r"\[step6:(?P<stage>\w+)\] fold (?P<fold>\d+)/(?P<foldn>\d+) "
+    r"ep (?P<ep>\d+): train=[\d.]+ val=[\d.]+ \((?P<el>[^)]+)\)")
+
+
+def _estimate_eta_folds(lines) -> bool:
+    """Projeta o tempo restante para o formato 'fold F/N ep E: ... (dur)'
+    (rolling-origin, usado no fine-tuning). O 'dur' impresso é a duração
+    DAQUELA ÉPOCA (não cumulativo — t_e é resetado a cada época no
+    código), então a duração de um fold completo é a SOMA das durações
+    de suas épocas — abordagem robusta ao early stopping (não presume
+    nº fixo de épocas por fold). Retorna True se encontrou dados."""
+    hits = []
+    for l in lines:
+        m = _RE_FOLD.search(l)
+        if m:
+            el = _parse_t(m["el"])
+            if el is not None:
+                hits.append({"stage": m["stage"], "fold": int(m["fold"]),
+                            "foldn": int(m["foldn"]), "ep": int(m["ep"]),
+                            "el": el})
+    if not hits:
+        return False
+    stage, foldn = hits[-1]["stage"], hits[-1]["foldn"]
+    by_fold = {}
+    for h in hits:
+        by_fold.setdefault(h["fold"], []).append(h["el"])
+    folds_sorted = sorted(by_fold)
+    cur_fold = folds_sorted[-1]
+    completed = [sum(by_fold[f]) for f in folds_sorted[:-1]]  # folds fechados
+    elapsed_cur = sum(by_fold[cur_fold])
+    avg_fold = sum(completed) / len(completed) if completed else elapsed_cur
+    remaining_cur = max(0.0, avg_fold - elapsed_cur)
+    remaining_folds_after = max(0, foldn - cur_fold)
+    eta = remaining_cur + remaining_folds_after * avg_fold
+
+    print(f"\n[ETA — estágio '{stage}'] fold atual: {cur_fold}/{foldn} "
+          f"(época {hits[-1]['ep']} em andamento)")
+    if completed:
+        print(f"  duração média de fold(s) concluído(s) "
+              f"({len(completed)}): {_fmt_hms(avg_fold)}")
+    print(f"  tempo decorrido no fold atual: {_fmt_hms(elapsed_cur)}")
+    print(f"  ETA para o FIM do estágio '{stage}': "
+          f"~{_fmt_hms(eta)} a partir de agora")
+    print(f"  [!] Estimativa aproximada: o nº de épocas por fold varia "
+          f"com o early stopping, então usa-se a duração TOTAL média dos "
+          f"folds já concluídos como referência, não um nº fixo de "
+          f"épocas.")
+    return True
+
+
 
 def _fmt_hms(seconds: float) -> str:
     if seconds < 0:
@@ -199,22 +250,38 @@ def analyze(path: Path) -> None:
             num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
             den = sum((x - mx) ** 2 for x in xs) or 1e-9
             slope = num / den                  # GB por segundo
+            slope_min = slope * 60
             print(f"\n  Tendência de RAM_disp (últimos {n} pontos): "
-                  f"{slope * 60:+.2f} GB/min")
-            if slope < -1e-6:
+                  f"{slope_min:+.3f} GB/min")
+            # LIMIAR: abaixo de 0,05 GB/min (~72GB/dia) é ruído de medição
+            # (flutuação normal de cache/alocador), não vazamento — evita
+            # alarme falso quando a janela cruza uma queda ÚNICA (ex.: o
+            # carregamento eager do fine-tuning) seguida de platô estável.
+            EPS = 0.05
+            if abs(slope_min) < EPS:
+                print("  RAM_disp ESTÁVEL — variação dentro do ruído "
+                      "normal, sem indício de vazamento.")
+            elif slope_min < 0:
                 t_zero = ys[-1] / (-slope)
-                h = int(t_zero // 3600); mrest = int((t_zero % 3600) // 60)
-                print(f"  [!] EM QUEDA — no ritmo atual, RAM_disp chegaria "
-                      f"a 0 em ~{h}h{mrest:02d}m. Se isso NÃO for esperado "
-                      f"(ex.: RSS do processo está plano), é sinal de "
-                      f"vazamento fora do processo principal (ex.: "
-                      f"/dev/shm) — considere reiniciar com a versão "
-                      f"corrigida antes de perder o progresso num crash "
-                      f"não controlado.")
-            elif slope > 1e-6:
-                print("  RAM_disp em RECUPERAÇÃO — sem risco aparente.")
+                if t_zero < 10 * 86400:         # só alarma se < ~10 dias
+                    h = int(t_zero // 3600); mrest = int((t_zero % 3600) // 60)
+                    print(f"  [!] EM QUEDA — no ritmo atual, RAM_disp "
+                          f"chegaria a 0 em ~{h}h{mrest:02d}m. Se isso NÃO "
+                          f"for esperado (ex.: RSS do processo está "
+                          f"plano), é sinal de vazamento fora do processo "
+                          f"principal (ex.: /dev/shm) — considere "
+                          f"reiniciar com a versão corrigida antes de "
+                          f"perder o progresso num crash não controlado.")
+                else:
+                    print(f"  Leve tendência de queda, mas em ritmo tão "
+                          f"lento (projeção de esgotamento: "
+                          f"{_fmt_hms(t_zero)}) que não é motivo de "
+                          f"preocupação — provavelmente ruído residual de "
+                          f"uma queda pontual (ex.: um carregamento) "
+                          f"dentro da janela analisada, não um vazamento "
+                          f"contínuo. Continue monitorando.")
             else:
-                print("  RAM_disp ESTÁVEL — sem risco aparente.")
+                print("  RAM_disp em RECUPERAÇÃO — sem risco aparente.")
     else:
         print("[recursos] nenhum snapshot [recursos] encontrado — o processo "
               "pode ter morrido ANTES do primeiro snapshot (ex.: durante o "
@@ -233,7 +300,8 @@ def analyze(path: Path) -> None:
     #  - streaming (_fit_scale):   "ep E/N shard S/T | train=... val=..."
     _tail(lambda l: ("[step6:" in l and "train=" in l and "val=" in l),
           "progresso de treino (época/shard)")
-    _estimate_eta(lines)
+    if not _estimate_eta_folds(lines):
+        _estimate_eta(lines)
     _tail(lambda l: "época" in l.lower() and "completa" in l.lower(),
           "épocas concluídas")
     _tail(lambda l: "estágio" in l or "fonte '" in l or "combinado" in l
