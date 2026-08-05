@@ -38,6 +38,112 @@ def _to_gb(v: str, u: str) -> float:
     return float(v) * _UNIT.get(u, 1) / 2**30
 
 
+def _parse_t(t: str) -> float | None:
+    """Converte 't+1h03m12s' / '5m02s' / '27.0s' em segundos (float)."""
+    if not t or t == "?":
+        return None
+    m = re.match(r"(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", t)
+    if not m or not any(m.groups()):
+        return None
+    h, mi, s = (float(g) if g else 0.0 for g in m.groups())
+    return h * 3600 + mi * 60 + s
+
+
+_RE_PROGRESS = re.compile(
+    r"\[step6:(?P<stage>\w+)\] ep (?P<ep>\d+)/(?P<epn>\d+) "
+    r"shard (?P<sh>\d+)/(?P<shn>\d+) \| train=[\d.]+ val=[\d.]+ "
+    r"\((?P<el>[^,]+),")
+
+
+def _fmt_hms(seconds: float) -> str:
+    if seconds < 0:
+        return "?"
+    d, rem = divmod(int(seconds), 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    if d:
+        return f"{d}d{h:02d}h{m:02d}m"
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m"
+
+
+def _estimate_eta(lines) -> None:
+    """Projeta o tempo restante a partir das linhas de progresso do
+    streaming ('ep E/N shard S/T | ... (elapsed, ...'). Usa a duração de
+    épocas JÁ CONCLUÍDAS (quando houver) para uma média real; a época em
+    curso usa a taxa observada (shards processados / tempo decorrido)
+    extrapolada para o que falta. Cobre apenas o ESTÁGIO ATUAL do log —
+    um estágio seguinte (ex.: fine-tuning após pré-treino) não tem como
+    ser projetado a partir daqui, e isso é dito explicitamente."""
+    hits = []
+    for l in lines:
+        m = _RE_PROGRESS.search(l)
+        if m:
+            el = _parse_t(m["el"])
+            if el is not None:
+                hits.append({"stage": m["stage"], "ep": int(m["ep"]),
+                            "epn": int(m["epn"]), "sh": int(m["sh"]),
+                            "shn": int(m["shn"]), "elapsed": el})
+    if not hits:
+        return
+    stage, epn, shn = hits[-1]["stage"], hits[-1]["epn"], hits[-1]["shn"]
+    by_ep = {}
+    for h in hits:
+        by_ep.setdefault(h["ep"], []).append(h)
+    eps_sorted = sorted(by_ep)
+    cur_ep = eps_sorted[-1]
+    cur_pts = by_ep[cur_ep]
+
+    # Duração de épocas CONCLUÍDAS (todo ep < cur_ep tem, por definição,
+    # terminado — sua última amostra registrada é o fim daquela época).
+    completed_durs = [by_ep[e][-1]["elapsed"] for e in eps_sorted[:-1]]
+
+    # Taxa da época EM CURSO: regressão linear shard~elapsed nos pontos
+    # observados (robusta a espaçamento irregular entre snapshots).
+    xs = [p["elapsed"] for p in cur_pts]
+    ys = [p["sh"] for p in cur_pts]
+    if len(xs) >= 2:
+        n = len(xs)
+        mx, my = sum(xs) / n, sum(ys) / n
+        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        den = sum((x - mx) ** 2 for x in xs) or 1e-9
+        rate = num / den                                  # shards/segundo
+    else:
+        rate = ys[-1] / max(xs[-1], 1e-9)
+    if rate <= 0:
+        print("\n[ETA] taxa de progresso não-positiva — sem dados "
+              "suficientes para projetar.")
+        return
+
+    sh_last, el_last = cur_pts[-1]["sh"], cur_pts[-1]["elapsed"]
+    remaining_in_epoch = (shn - sh_last) / rate
+    # Duração total estimada da época atual (para projetar as SEGUINTES):
+    full_epoch_est = (sum(completed_durs) / len(completed_durs)
+                      if completed_durs else shn / rate)
+    remaining_epochs_after = max(0, epn - cur_ep)
+    eta_stage = remaining_in_epoch + remaining_epochs_after * full_epoch_est
+
+    print(f"\n[ETA — estágio '{stage}'] "
+          f"época atual: {cur_ep}/{epn} | shard {sh_last}/{shn} "
+          f"({100*sh_last/shn:.1f}%)")
+    print(f"  taxa observada nesta época: {rate*60:.2f} shards/min")
+    if completed_durs:
+        print(f"  duração média de época(s) concluída(s) "
+              f"({len(completed_durs)}): {_fmt_hms(sum(completed_durs)/len(completed_durs))}")
+    print(f"  tempo p/ terminar a época atual: {_fmt_hms(remaining_in_epoch)}")
+    if remaining_epochs_after:
+        print(f"  + {remaining_epochs_after} época(s) subsequente(s) "
+              f"(~{_fmt_hms(full_epoch_est)} cada, estimado)")
+    print(f"  ETA para o FIM do estágio '{stage}': "
+          f"~{_fmt_hms(eta_stage)} a partir de agora")
+    print(f"  [!] Cobre só o estágio '{stage}'. Se houver um estágio "
+          f"seguinte no seu comando (ex.: fine-tuning após pré-treino), "
+          f"o tempo dele NÃO está incluído aqui — este log ainda não "
+          f"tem dados para projetá-lo. O early stopping também pode "
+          f"encerrar antes das {epn} épocas, encurtando este total.")
+
+
 def analyze(path: Path) -> None:
     lines = path.read_text(errors="replace").splitlines()
     print(f"# Análise de {path}")
@@ -77,6 +183,38 @@ def analyze(path: Path) -> None:
         if ramN < 5:
             print(f"  [!] RAM disponível no fim: {ramN:.1f}G — perto do "
                   f"esgotamento (risco de OOM kill).")
+
+        # LINHA CRUCIAL: tendência de RAM_disp e projeção de esgotamento.
+        # RSS do processo pode ficar PLANO mesmo com vazamento em memória
+        # que não é RSS (ex.: /dev/shm sob a estratégia 'file_system') —
+        # é RAM_disp caindo que denuncia isso. Ajusta uma reta aos últimos
+        # pontos e projeta quando chegaria a zero, se a tendência persistir.
+        pts = [(( _parse_t(t)), ram) for _, _, ram, _, _, t in res]
+        pts = [(x, y) for x, y in pts if x is not None]
+        if len(pts) >= 4:
+            xs = [p[0] for p in pts[-12:]]     # últimos ~12 snapshots
+            ys = [p[1] for p in pts[-12:]]
+            n = len(xs)
+            mx, my = sum(xs) / n, sum(ys) / n
+            num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+            den = sum((x - mx) ** 2 for x in xs) or 1e-9
+            slope = num / den                  # GB por segundo
+            print(f"\n  Tendência de RAM_disp (últimos {n} pontos): "
+                  f"{slope * 60:+.2f} GB/min")
+            if slope < -1e-6:
+                t_zero = ys[-1] / (-slope)
+                h = int(t_zero // 3600); mrest = int((t_zero % 3600) // 60)
+                print(f"  [!] EM QUEDA — no ritmo atual, RAM_disp chegaria "
+                      f"a 0 em ~{h}h{mrest:02d}m. Se isso NÃO for esperado "
+                      f"(ex.: RSS do processo está plano), é sinal de "
+                      f"vazamento fora do processo principal (ex.: "
+                      f"/dev/shm) — considere reiniciar com a versão "
+                      f"corrigida antes de perder o progresso num crash "
+                      f"não controlado.")
+            elif slope > 1e-6:
+                print("  RAM_disp em RECUPERAÇÃO — sem risco aparente.")
+            else:
+                print("  RAM_disp ESTÁVEL — sem risco aparente.")
     else:
         print("[recursos] nenhum snapshot [recursos] encontrado — o processo "
               "pode ter morrido ANTES do primeiro snapshot (ex.: durante o "
@@ -90,10 +228,19 @@ def analyze(path: Path) -> None:
             for l in hits[-n:]:
                 print("  " + l.strip()[:110])
 
-    _tail(lambda l: "fold" in l and "ep" in l, "épocas")
-    _tail(lambda l: "estágio" in l or "fonte '" in l or "combinado" in l,
+    # Cobre os DOIS vocabulários de progresso de treino:
+    #  - rolling-origin (_fit):    "fold J/N ep E: train=... val=..."
+    #  - streaming (_fit_scale):   "ep E/N shard S/T | train=... val=..."
+    _tail(lambda l: ("[step6:" in l and "train=" in l and "val=" in l),
+          "progresso de treino (época/shard)")
+    _estimate_eta(lines)
+    _tail(lambda l: "época" in l.lower() and "completa" in l.lower(),
+          "épocas concluídas")
+    _tail(lambda l: "estágio" in l or "fonte '" in l or "combinado" in l
+          or ": streaming" in l or "shards (amostra" in l,
           "carregamento/estágios")
-    _tail(lambda l: "shard" in l.lower() and "grav" in l.lower(), "shards")
+    _tail(lambda l: "shard" in l.lower() and "grav" in l.lower(),
+          "shards gravados (passo 2-3)")
     _tail(lambda l: "FIM" in l or "interrompid" in l.lower(), "conclusão")
 
     # 4) Última linha não-vazia (onde parou)
