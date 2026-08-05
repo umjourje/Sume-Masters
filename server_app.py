@@ -1,19 +1,31 @@
 """server_app.py — ServerApp Flower (Message API) para o W-LSTMix federado.
 
 FUSÃO: mantém a SUA versão (fractions=1.0, TensorBoardFedAvg com checkpoint
-do melhor global por selection_metric, TLS via SuperLink, salvamento de
-final + best, pacote do app) + o bloco do "v0" decidido neste chat: o
-modelo da rodada 1 NÃO é aleatório — são os pesos do treino CENTRALIZADO
-no sintético (passo 6, máquina grande), carregados com strict=True.
+do melhor global por selection_metric, salvamento de final + best, pacote
+do app) + o bloco do "v0" decidido neste chat: o modelo da rodada 1 NÃO é
+aleatório — são os pesos do treino no REAL (passo 6, --data-scope real,
+tag v0_real), carregados com strict=True.
 
-Execução (máquina servidora):
+Execução (máquina servidora) — SEM TLS, por decisão explícita: rede local
+fechada e controlada, TLS fica para trabalho futuro (não muda os
+resultados nesse cenário):
 
-    flower-superlink \
-        --ssl-ca-certfile certificates/ca.crt \
-        --ssl-certfile certificates/server.pem \
-        --ssl-keyfile certificates/server.key
+    flower-superlink --insecure
 
     flwr run . raspberry-deployment
+
+⚠️ NÃO EXECUTADO/VERIFICADO neste ambiente: confirme a flag exata de modo
+inseguro (`--insecure`) contra `flower-superlink --help` na SUA versão
+instalada do Flower antes de rodar — o nome/comportamento pode variar
+entre versões menores. O mesmo vale para `flower-supernode` em cada Pi.
+
+Se decidir adicionar TLS no futuro, troque para:
+    flower-superlink \\
+        --ssl-ca-certfile certificates/ca.crt \\
+        --ssl-certfile certificates/server.pem \\
+        --ssl-keyfile certificates/server.key
+e restaure `root-certificates = "certificates/ca.crt"` no pyproject.toml
+(em vez de `insecure = true`).
 
 TensorBoard: tensorboard --logdir tb_logs/server
 """

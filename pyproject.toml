@@ -1,8 +1,11 @@
 [project]
 name = "wlstmix-fed-anomaly"
 version = "0.1.0"
+# duckdb REMOVIDO: confirmado que nem client_app nem server_app o
+# importam (é usado só nos passos 1-3 de preparação de dados, na
+# máquina grande — não precisa estar instalado nos Raspberries).
 dependencies = ["flwr>=1.21", "torch", "numpy", "pandas", "scikit-learn",
-                "pywavelets", "tensorboard", "python-dotenv", "duckdb"]
+                "pywavelets", "tensorboard", "python-dotenv"]
 
 [tool.flwr.app]
 publisher = "tupa"
@@ -15,16 +18,23 @@ clientapp = "client_app:app"
 num-server-rounds = 10
 local-epochs = 1
 lr = 0.001
-v0-path = "/caminho/para/04_models/rolling/best_model.pth"
+v0-path = "/caminho/para/04_models/v0_real/best_model.pth"
 
 [tool.flwr.federations]
 default = "local-sim"
 
-# Ensaio local (4 supernós simulados) antes dos Raspberries:
+# Ensaio local: 5 supernós simulados (mesmo nº dos 5 Raspberries reais),
+# cada um podendo já apontar para uma pasta de partição diferente via
+# node-config, para validar o fluxo INTEIRO antes de tocar nos Pis.
 [tool.flwr.federations.local-sim]
-options.num-supernodes = 4
+options.num-supernodes = 5
 
-# Implantação real com TLS (ajuste o endereço do SuperLink):
+# Implantação real, SEM TLS (rede local fechada e controlada — decisão
+# explícita; TLS fica para trabalho futuro, não muda os resultados numa
+# rede confiável). ⚠️ NÃO EXECUTADO/VERIFICADO neste ambiente: confirme
+# a chave exata para modo inseguro contra `flwr run --help` e a versão
+# instalada do Flower — em algumas versões é necessário `insecure = true`
+# aqui e/ou a flag --insecure no flower-superlink/flower-supernode.
 [tool.flwr.federations.raspberry-deployment]
 address = "servidor:9093"
-root-certificates = "certificates/ca.crt"
+insecure = true
