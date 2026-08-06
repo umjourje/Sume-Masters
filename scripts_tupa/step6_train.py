@@ -35,9 +35,9 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
 from config import CFG
 from perf_log import RunLogger, _fmt_dur
 from model_hybrid import HybridWLSTMix
-from step2_3_windows_wavelet_v2 import (make_windows, decompose_windows_batch,
+from step2_3_windows_wavelet import (make_windows, decompose_windows_batch,
                                      standardize_batch)
-from step4_5_labels_v2 import label_windows_batch, fuse_labels
+from step4_5_labels import label_windows_batch, fuse_labels
 
 
 def _speed_setup():
@@ -477,6 +477,31 @@ def _estimate_pos_weight(shard_paths, device, k=8):
     return torch.tensor((tot - pos) / pos, dtype=torch.float32, device=device)
 
 
+def _write_history_incremental(out_dir, tag_stage, history) -> None:
+    """Grava o histórico ACUMULADO até agora (todas as épocas já concluídas
+    deste estágio), atomicamente. Complementa progress.json (que mostra só
+    o instante atual) com a série completa para plotar a curva de perda a
+    qualquer momento, sem esperar o treino terminar."""
+    import json as _json
+    tmp = out_dir / f"history_{tag_stage}.json.tmp"
+    tmp.write_text(_json.dumps(history, indent=2))
+    tmp.replace(out_dir / f"history_{tag_stage}.json")
+
+
+def _write_progress(out_dir, payload: dict) -> None:
+    """Grava out_dir/progress.json de forma ATÔMICA (.tmp + rename): um
+    arquivo pequeno, sempre íntegro, que resume o estado ATUAL do treino
+    sem exigir leitura do log grande. Seguro para 'cat' a qualquer
+    momento, inclusive durante a escrita (o rename só troca o arquivo
+    quando o conteúdo já está completo no disco)."""
+    import json as _json
+    payload = {**payload, "atualizado_em": time.strftime(
+        "%Y-%m-%dT%H:%M:%S")}
+    tmp = out_dir / "progress.json.tmp"
+    tmp.write_text(_json.dumps(payload, indent=2, default=str))
+    tmp.replace(out_dir / "progress.json")
+
+
 def _fit_scale(shard_list, model, device, logger, out_dir, lr, tag_stage):
     """Treino em ESCALA por STREAMING de shards: processa um shard por vez
     (RAM = 1 shard), com validação temporal intra-shard e early stopping
@@ -510,12 +535,33 @@ def _fit_scale(shard_list, model, device, logger, out_dir, lr, tag_stage):
                 va = run_epoch(model, vl, mse, bce, device, scaler)
                 va_sum += va * len(va_ds); va_n += len(va_ds)
             if si % 25 == 0 or si == len(order):
+                elapsed = time.time() - t_e
+                rate = si / max(elapsed, 1e-6)               # shards/seg
+                eta_epoch = (len(order) - si) / max(rate, 1e-9)
                 logger.term(f"[step6:{tag_stage}] ep {ep+1}/{CFG.epochs_scale} "
                             f"shard {si}/{len(order)} | "
                             f"train={tr_sum/max(tr_n,1):.4f} "
                             f"val={va_sum/max(va_n,1):.4f} "
-                            f"({_fmt_dur(time.time()-t_e)})")
+                            f"({_fmt_dur(elapsed)}, ETA época "
+                            f"{_fmt_dur(eta_epoch)})")
                 logger.snapshot(f"{tag_stage}_ep{ep}_shard{si}")
+                # LINHA CRUCIAL (visibilidade sem tocar o log grande):
+                # progress.json + checkpoint 'latest' na MESMA cadência.
+                _write_progress(out_dir, {
+                    "estagio": tag_stage, "epoca": ep + 1,
+                    "epocas_alvo": CFG.epochs_scale,
+                    "shard": si, "shards_totais": len(order),
+                    "pct_epoca": round(100 * si / len(order), 1),
+                    "train_loss_parcial": round(tr_sum / max(tr_n, 1), 6),
+                    "val_loss_parcial": round(va_sum / max(va_n, 1), 6),
+                    "shards_por_min": round(rate * 60, 2),
+                    "eta_fim_epoca": _fmt_dur(eta_epoch),
+                    "melhor_val_ate_agora": (None if best == float("inf")
+                                             else round(best, 6)),
+                })
+                tmp = out_dir / f"latest_{tag_stage}.pth.tmp"
+                torch.save(model.state_dict(), tmp)
+                tmp.replace(out_dir / f"latest_{tag_stage}.pth")
         va_epoch = va_sum / max(va_n, 1)
         history.append({"stage": tag_stage, "epoch": ep,
                         "train": tr_sum/max(tr_n,1), "val": va_epoch})
@@ -531,6 +577,17 @@ def _fit_scale(shard_list, model, device, logger, out_dir, lr, tag_stage):
             if wait >= CFG.patience:
                 logger.term(f"[step6:{tag_stage}] early stopping (época {ep+1})")
                 break
+        # history INCREMENTAL: grava a cada época, não só no fim de tudo —
+        # se o processo cair, você não perde o histórico já acumulado.
+        _write_history_incremental(out_dir, tag_stage, history)
+        _write_progress(out_dir, {
+            "estagio": tag_stage, "epoca": ep + 1,
+            "epocas_alvo": CFG.epochs_scale, "epoca_completa": True,
+            "train_loss": round(tr_sum / max(tr_n, 1), 6),
+            "val_loss": round(va_epoch, 6),
+            "melhor_val_ate_agora": round(best, 6),
+            "early_stop_wait": f"{wait}/{CFG.patience}",
+        })
     model.load_state_dict(torch.load(out_dir / f"best_{tag_stage}.pth",
                                      map_location=device))
     return [best], history
@@ -566,10 +623,22 @@ def _fit(full, model, device, logger, out_dir, lr, tag_stage):
                         f"ep {ep+1}: train={tr:.4f} val={va:.4f} "
                         f"({_fmt_dur(time.time() - t_e)})")
             logger.snapshot(f"{tag_stage}_f{j}_e{ep}")
+            # MESMOS artefatos leves do streaming: progresso + histórico
+            # incremental, para 'cat' funcionar igual em qualquer estágio.
+            _write_history_incremental(out_dir, tag_stage, history)
+            _write_progress(out_dir, {
+                "estagio": tag_stage, "fold": j + 1, "folds_totais": len(folds),
+                "epoca": ep + 1, "epocas_alvo": CFG.epochs_per_fold,
+                "train_loss": round(tr, 6), "val_loss": round(va, 6),
+                "melhor_val_ate_agora": (None if best == float("inf")
+                                         else round(best, 6)),
+                "early_stop_wait": f"{wait}/{CFG.patience}",
+            })
             if va < best:
                 best, wait = va, 0
-                torch.save(model.state_dict(),
-                           out_dir / f"best_{tag_stage}_fold{j}.pth")
+                tmp = out_dir / f"best_{tag_stage}_fold{j}.pth.tmp"
+                torch.save(model.state_dict(), tmp)     # escrita ATÔMICA
+                tmp.replace(out_dir / f"best_{tag_stage}_fold{j}.pth")
             else:
                 wait += 1
                 if wait >= CFG.patience:
