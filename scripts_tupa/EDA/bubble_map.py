@@ -252,8 +252,7 @@ def plot_matplotlib(df: pd.DataFrame, outdir: Path, scale: str,
     for spine in ax.spines.values():
         spine.set_visible(False)
     ax.set_title("EnergyBench — densidade de observações por localização "
-                "(dataset real utilizado; área e cor da bolha ∝ nº de "
-                f"observações, escala {scale})")
+                f", escala {scale})")
 
     fig.tight_layout()
     fig.savefig(outdir / "bubble_map.png", dpi=150)
