@@ -18,11 +18,38 @@ Uso:
 """
 from __future__ import annotations
 import argparse
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "federated_real"))
-from country_map import SUBSETS, PI_BUCKETS  # fonte única de verdade
+def _localizar_country_map(explicito: str | None) -> Path:
+    """Busca country_map.py em candidatos plausíveis, em vez de presumir
+    uma estrutura de pastas fixa (que não bate com todo ambiente).
+    Ordem: (1) caminho explícito via --country-map-dir; (2) mesma pasta
+    do script; (3) pai, avô, bisavô da pasta do script; (4) variável de
+    ambiente COUNTRY_MAP_DIR."""
+    aqui = Path(__file__).resolve().parent
+    candidatos = []
+    if explicito:
+        candidatos.append(Path(explicito))
+    if os.environ.get("COUNTRY_MAP_DIR"):
+        candidatos.append(Path(os.environ["COUNTRY_MAP_DIR"]))
+    candidatos += [aqui, aqui.parent, aqui.parent.parent,
+                  aqui.parent.parent.parent, aqui / "federated_real",
+                  aqui.parent / "federated_real"]
+    for c in candidatos:
+        if (c / "country_map.py").exists():
+            return c
+    raise FileNotFoundError(
+        "Não encontrei country_map.py. Tentado em: "
+        + ", ".join(str(c) for c in candidatos)
+        + ". Use --country-map-dir /caminho/exato ou defina a variável "
+          "de ambiente COUNTRY_MAP_DIR, ou copie country_map.py para a "
+          "mesma pasta deste script.")
+
+
+# a busca real acontece dentro de main(), depois do parse dos argumentos
+# (--country-map-dir precisa estar disponível primeiro)
 
 # Centróides nacionais aproximados (lat, lon) — suficientes para um mapa
 # de bolhas em escala de país; NÃO são centróides geodésicos oficiais.
@@ -85,7 +112,16 @@ def main():
     ap.add_argument("--out", type=Path, default=Path("bubble_map_real.jpg"))
     ap.add_argument("--width", type=int, default=1400)
     ap.add_argument("--height", type=int, default=800)
+    ap.add_argument("--country-map-dir", type=str, default=None,
+                    help="pasta que contém country_map.py, se não estiver "
+                         "em nenhum dos caminhos buscados automaticamente")
     a = ap.parse_args()
+
+    pasta = _localizar_country_map(a.country_map_dir)
+    sys.path.insert(0, str(pasta))
+    global SUBSETS, PI_BUCKETS
+    from country_map import SUBSETS, PI_BUCKETS  # fonte única de verdade
+    print(f"[bubble_map_real] country_map.py localizado em: {pasta}")
 
     import plotly.graph_objects as go
     import numpy as np
