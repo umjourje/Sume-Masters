@@ -25,13 +25,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.environ.get("PIPELINE_DIR", "."))
 from config import CFG                                       # noqa: E402
 from model_hybrid import HybridWLSTMix                       # noqa: E402
 from step4_5_labels import label_windows_batch, fuse_labels  # noqa: E402
-from step6_train import WindowedPTDataset, run_epoch         # noqa: E402
+from step6_train import (WindowedPTDataset, LazyWindowedPTDataset,  # noqa: E402
+                         run_epoch)
 
 # Métricas do paper, com fallback (convenção do seu task original)
 try:
@@ -66,31 +67,85 @@ def _load_local(split: str, data_root: Path):
 
 
 # ------------------------------- TREINO -----------------------------------
+def _contar_janelas(pts) -> int:
+    """Total de janelas SEM carregar os tensores pesados: o
+    LazyWindowedPTDataset lê só o cabeçalho (via mmap). Necessário porque
+    'num-examples' é o peso do cliente no FedAvg e precisa ser o total
+    real, não uma estimativa."""
+    return sum(len(LazyWindowedPTDataset(p)) for p in pts)
+
+
+def _estimar_pos_weight(pts, device, max_shards: int = 8) -> torch.Tensor:
+    """pos_weight do BCE estimado a partir de uma AMOSTRA de shards.
+    Antes era calculado concatenando os rótulos de TODOS os shards
+    (torch.cat), o que materializava o dataset inteiro em RAM — a mesma
+    causa raiz do estouro de memória que motivou o streaming no passo 6.
+    A taxa de anomalia é estável entre shards (é definida por percentis
+    intra-janela), então uma amostra dá a mesma ordem de grandeza."""
+    amostra = pts if len(pts) <= max_shards else [
+        pts[i] for i in np.linspace(0, len(pts) - 1, max_shards).astype(int)]
+    pos = tot = 0.0
+    for p in amostra:
+        ds = WindowedPTDataset(p)
+        pos += float(ds.cls_tg.sum())
+        tot += float(ds.cls_tg.numel())
+        del ds
+    pos = max(pos, 1.0)
+    return torch.tensor((tot - pos) / pos, device=device)
+
+
 def train(model: HybridWLSTMix, data_root: Path, device,
           epochs: int = 1, lr: float = 1e-3) -> dict:
     """Função pura (sem early stopping local — decisão é do servidor,
-    via checkpoint do melhor global na TensorBoardFedAvg)."""
+    via checkpoint do melhor global na TensorBoardFedAvg).
+
+    STREAMING POR SHARD (não eager): carrega um shard, treina nele,
+    descarta. O pico de RAM é o de UM shard (~2GB), não a soma de todos.
+    Motivo: o cliente do nó da Espanha tem ~26,3 milhões de janelas
+    (~118GB de shards) contra 16GB de RAM no Raspberry Pi — a carga
+    eager anterior (ConcatDataset de todos os shards) não caberia.
+    É a mesma estratégia validada no passo 6 (_fit_scale), que rodou
+    116h com RAM estável em ~2,2GB.
+
+    A ordem dos shards é embaralhada a cada época (o shuffle interno do
+    DataLoader só embaralha DENTRO do shard corrente).
+    """
     pts = _load_local("train", data_root)
     if not pts:
         raise RuntimeError(f"Sem shards de treino em {data_root}")
-    full = ConcatDataset([WindowedPTDataset(p) for p in pts])
-    loader = DataLoader(full, batch_size=CFG.batch_size, shuffle=True,
-                        num_workers=min(CFG.loader_workers, 4),
-                        pin_memory=device.type == "cuda")
-    ys = torch.cat([d.cls_tg.flatten() for d in full.datasets])
-    pos = ys.sum().clamp(min=1.0)
-    bce = torch.nn.BCEWithLogitsLoss(
-        pos_weight=((ys.numel() - pos) / pos).to(device))
+
+    n_total = _contar_janelas(pts)          # peso do FedAvg, sem carregar
+    bce = torch.nn.BCEWithLogitsLoss(pos_weight=_estimar_pos_weight(pts, device))
     mse = torch.nn.MSELoss()
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler(enabled=CFG.use_amp and
                                   device.type == "cuda")
-    losses = [run_epoch(model, loader, mse, bce, device, scaler, opt)
-              for _ in range(epochs)]
+    rng = np.random.default_rng(0)
+
+    losses = []
+    for _ in range(epochs):
+        soma = peso = 0.0
+        for k in rng.permutation(len(pts)):
+            ds = WindowedPTDataset(pts[k])          # 1 shard por vez
+            if not len(ds):
+                continue
+            # num_workers=0 no streaming: o shard JÁ está em RAM, então
+            # workers de IPC não trazem ganho — e, sob a estratégia
+            # 'file_system', recriar DataLoaders a cada shard vaza
+            # memória via /dev/shm (diagnosticado no passo 6).
+            loader = DataLoader(ds, batch_size=CFG.batch_size, shuffle=True,
+                                num_workers=0,
+                                pin_memory=device.type == "cuda")
+            l = run_epoch(model, loader, mse, bce, device, scaler, opt)
+            soma += float(l) * len(ds)              # média ponderada real
+            peso += len(ds)
+            del loader, ds
+        losses.append(soma / max(peso, 1.0))
+
     return {
         "train_loss": float(losses[-1]),
         "train_loss_epochs": [float(v) for v in losses],  # curva p/ TB
-        "num-examples": len(full),                        # peso do FedAvg
+        "num-examples": n_total,                          # peso do FedAvg
     }
 
 
