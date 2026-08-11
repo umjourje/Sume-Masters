@@ -31,6 +31,12 @@ from pathlib import Path
 # config.py exige RAW_ROOT/OUT_ROOT no ambiente; num Pi de treino local
 # esses caminhos não são usados de fato (dados vêm de --train/--test-dir),
 # então definimos valores neutros ANTES de importar módulos do pipeline.
+#
+# ATENÇÃO — a ÚNICA variável que realmente precisa estar correta no Pi é
+# WLSTMIX_DIR, apontando para a pasta do repositório W-LSTMix que contém
+# models/W_LSTMix.py (o backbone é importado de lá por model_hybrid.py).
+# Sem ela, o script falha no import com mensagem explícita.
+# Ex.:  export WLSTMIX_DIR=/mnt/nas/W-LSTMix
 os.environ.setdefault("RAW_ROOT", "/tmp/raw_unused")
 os.environ.setdefault("OUT_ROOT", "/tmp/out_unused")
 
@@ -173,7 +179,7 @@ def main() -> None:
 
     # ------- avaliação no TESTE: rótulo em execução + matriz de confusão -------
     model.eval()
-    B, F = CFG.backcast, CFG.forecast
+    B = CFG.backcast_length
     tp = tn = fp = fn = 0
     with torch.no_grad():
         for sp in test_shards:
