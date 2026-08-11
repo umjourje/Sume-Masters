@@ -13,9 +13,16 @@ Reusa as peças JÁ VALIDADAS do pipeline (nada de código de treino novo):
 
 Uso (rodar DUAS vezes, trocando --init-checkpoint e --tag):
   python train_local_pi.py \
-      --train-dir /mnt/nas/.../pi1/train --test-dir /mnt/nas/.../pi1/test \
+      --windows-root /mnt/nas/EnergyBench-Anomaly/02_windows/Hourly \
+      --pi 1 \
       --init-checkpoint /mnt/nas/.../04_models/v0_final/best_model.pth \
-      --epochs 100 --max-shards 15 --tag esp_v0both --outdir ./local_runs
+      --epochs 30 --max-shards 15 --tag esp_v0both --outdir /mnt/nas/local_runs
+
+Os shards NÃO ficam em subpasta por subconjunto: são arquivos soltos em
+<windows_root>/<split>/<Setor>/ nomeados <Subconjunto>.wNN.partKKK.pt.
+Por isso a seleção é por GRUPO (via --pi, lendo country_map.py, ou via
+--groups manual), nunca por varredura de diretório — que capturaria
+todos os países daquele setor.
 
 Saídas em <outdir>/<tag>/: best_local.pth, progress.json,
 confusion_matrix.json, confusion_matrix.png, metrics.json.
@@ -29,7 +36,7 @@ import time
 from pathlib import Path
 
 # config.py exige RAW_ROOT/OUT_ROOT no ambiente; num Pi de treino local
-# esses caminhos não são usados de fato (dados vêm de --train/--test-dir),
+# esses caminhos não são usados de fato (os dados vêm de --windows-root),
 # então definimos valores neutros ANTES de importar módulos do pipeline.
 #
 # ATENÇÃO — a ÚNICA variável que realmente precisa estar correta no Pi é
@@ -55,8 +62,32 @@ def _add_repo_to_path(repo_dir: str | None) -> None:
         "pasta scripts_tupa do repositório.")
 
 
-def _shards(d: Path) -> list[Path]:
-    return sorted(d.rglob("*.pt"))
+def _shards_de_grupos(windows_root: Path, split: str,
+                      grupos: list[str]) -> list[Path]:
+    """Seleciona os shards de subconjuntos ESPECÍFICOS.
+
+    Os shards NÃO ficam em subpasta por subconjunto: são arquivos soltos
+    em <windows_root>/<split>/<Setor>/ com o nome do subconjunto como
+    prefixo (<Nome>.wNN.partKKK.pt). Portanto, apontar para a pasta
+    <Setor> e varrer *.pt pegaria TODOS os países daquele setor — erro
+    silencioso e grave num experimento por país.
+
+    O ponto literal depois do nome evita colisão de prefixo (ex.: 'REED'
+    não captura 'REEDD'; 'NEST-Commercial' e 'NEST-Residential' já ficam
+    em setores distintos).
+    """
+    achados: list[Path] = []
+    for grupo in grupos:                       # "Setor/Nome"
+        setor, _, nome = grupo.partition("/")
+        d = windows_root / split / setor
+        if not d.exists():
+            print(f"  [AVISO] pasta inexistente: {d}")
+            continue
+        f = sorted(d.glob(f"{nome}.w*.part*.pt"))
+        if not f:
+            print(f"  [AVISO] nenhum shard de '{nome}' em {d}")
+        achados += f
+    return achados
 
 
 def _atomic_json(path: Path, obj) -> None:
@@ -67,8 +98,18 @@ def _atomic_json(path: Path, obj) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train-dir", type=Path, required=True)
-    ap.add_argument("--test-dir", type=Path, required=True)
+    ap.add_argument("--windows-root", type=Path, required=True,
+                    help="pasta 02_windows/<resolução>, ex.: "
+                         "/mnt/nas/EnergyBench-Anomaly/02_windows/Hourly")
+    ap.add_argument("--pi", type=int, choices=[1, 2, 3, 4, 5], default=None,
+                    help="usa o balde de países deste nó, conforme "
+                         "country_map.py (recomendado)")
+    ap.add_argument("--groups", nargs="+", default=None,
+                    help="alternativa manual ao --pi: lista de "
+                         "'Setor/Subconjunto', ex.: Residential/GoiEner")
+    ap.add_argument("--country-map-dir", type=str, default=None,
+                    help="pasta do country_map.py, se --pi for usado e o "
+                         "arquivo não estiver junto ao script")
     ap.add_argument("--init-checkpoint", type=Path, required=True,
                     help="pesos iniciais (best do v0_both OU do v0_real)")
     ap.add_argument("--epochs", type=int, default=100)
@@ -107,12 +148,36 @@ def main() -> None:
     model.load_state_dict(sd, strict=True)   # divergência falha AQUI, não na época 30
     print(f"[local] checkpoint inicial: {a.init_checkpoint}")
 
-    train_shards = _shards(a.train_dir)
-    test_shards = _shards(a.test_dir)
+    # ------------- resolução dos grupos (quais subconjuntos usar) -------------
+    if a.pi and a.groups:
+        raise SystemExit("use --pi OU --groups, não os dois")
+    if a.pi:
+        aqui = Path(__file__).resolve().parent
+        for c in ([Path(a.country_map_dir)] if a.country_map_dir else []) + [
+                aqui, aqui.parent, aqui.parent.parent, Path.cwd()]:
+            if (c / "country_map.py").exists():
+                sys.path.insert(0, str(c))
+                break
+        else:
+            raise FileNotFoundError(
+                "country_map.py não encontrado — use --country-map-dir "
+                "ou passe os grupos manualmente com --groups")
+        from country_map import groups_for_pi, pais_do_pi
+        grupos = groups_for_pi(a.pi)
+        print(f"[local] Pi{a.pi} -> países {pais_do_pi(a.pi)}")
+    elif a.groups:
+        grupos = a.groups
+    else:
+        raise SystemExit("informe --pi N ou --groups Setor/Nome [...]")
+    print(f"[local] {len(grupos)} grupo(s): {', '.join(grupos)}")
+
+    train_shards = _shards_de_grupos(a.windows_root, "train", grupos)
+    test_shards = _shards_de_grupos(a.windows_root, "test", grupos)
     if not train_shards or not test_shards:
         raise FileNotFoundError(
             f"shards não encontrados (train={len(train_shards)}, "
-            f"test={len(test_shards)}) — confira os caminhos do NAS")
+            f"test={len(test_shards)}) — confira --windows-root e se o "
+            f"passo 2-3 rodou para estes grupos em AMBOS os splits")
     if a.max_shards > 0 and len(train_shards) > a.max_shards:
         rng = np.random.default_rng(a.seed)
         idx = sorted(rng.choice(len(train_shards), a.max_shards,
