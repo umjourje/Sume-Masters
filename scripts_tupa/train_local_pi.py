@@ -92,7 +92,7 @@ def main() -> None:
     from torch.utils.data import DataLoader
 
     from step6_train import ShardTemporalDataset, run_epoch  # já validados
-    from step4_5_labels import label_windows_batch
+    from step4_5_labels_v2 import label_windows_batch
     from model_hybrid import HybridWLSTMix
     from config import CFG
 
