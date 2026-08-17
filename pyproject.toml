@@ -4,6 +4,9 @@ version = "0.1.0"
 # duckdb REMOVIDO: confirmado que nem client_app nem server_app o
 # importam (é usado só nos passos 1-3 de preparação de dados, na
 # máquina grande — não precisa estar instalado nos Raspberries).
+# tensorboard: exigido apenas no SERVIDOR (TensorBoardFedAvg); nos Pis
+# o pacote nunca é importado — se instalar via extras por dispositivo,
+# pode omiti-lo nos clientes sem efeito algum.
 dependencies = ["flwr>=1.21", "torch", "numpy", "pandas", "scikit-learn",
                 "pywavelets", "tensorboard", "python-dotenv"]
 
@@ -18,7 +21,20 @@ clientapp = "client_app:app"
 num-server-rounds = 10
 local-epochs = 1
 lr = 0.001
-v0-path = "/caminho/para/04_models/v0_real/best_model.pth"
+v0-path = "/mnt/juliana-truenas/Synth-EnergyBench-Anomaly/04_models/v0_final/best_model.pth"
+# V0BOTH=/mnt/juliana-truenas/Synth-EnergyBench-Anomaly/04_models/v0_final/best_model.pth
+# V0REAL=/mnt/juliana-truenas/Synth-EnergyBench-Anomaly/04_models/v0_real/best_model.pth
+# ---- NOVO (smoke test + observabilidade) ----
+# tag: identifica o run; nomeia loss_<tag>.jsonl, summary_<tag>.json,
+#      confusion_matrix_<tag>.json (Pis) e run_summary_<tag>.json (servidor).
+tag = "run"
+# max-shards: 0 = treino completo; N>0 = amostra uniformemente espaçada
+#      de N shards por cliente (uso: smoke test, ex. max-shards=2).
+max-shards = 0
+# metrics-dir NÃO fica aqui: é por dispositivo, declarado no node-config
+# de cada SuperNode:
+#   flower-supernode ... --node-config \
+#     "data-root='/dados/particao_X' metrics-dir='/home/pi/tupa_metrics'"
 
 [tool.flwr.federations]
 default = "local-sim"
