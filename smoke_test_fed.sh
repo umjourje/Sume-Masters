@@ -98,10 +98,10 @@ report() {
   # --full-units: total de SHARDS do treino completo por Pi (mesma unidade
   # do RunMonitor.tick no task.py). Conte com:
   #   ssh piN "find ${DATA_ROOT_PI}/02_windows -path '*/train/*.pt' | wc -l"
-  python smoke_report.py \
+  python3 scripts_tupa/smoke_report.py \
     --summaries "metrics_${TAG}/*/summary_${TAG}.json" \
     --json-out "smoke_report_${TAG}.json" "$@"
-  python plot_loss.py \
+  python3 scripts_tupa/plot_loss.py \
     --inputs "metrics_${TAG}/*/loss_${TAG}*.jsonl" \
     --out "plots_${TAG}" --fmt svg pdf --smooth 5
 }

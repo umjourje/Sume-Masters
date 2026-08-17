@@ -9,7 +9,7 @@ INTERIOR pela lógica consolidada neste chat:
   * MODELO: HybridWLSTMix — backbone models/W_LSTMix.py ORIGINAL,
     inalterado, + bloco de classificação ao final (o mesmo do passo 6;
     o v0 centralizado da máquina grande é instanciado na rodada 1).
-  * DADOS DE TREINO: artefatos anti-leak do pipeline
+  * DADOS DE TREINO: artefatos anti-leak do pipeline (passo 4-5 v2)
     (<data_root>/02_windows/<res>/train/**.pt, com labels_fused) —
     substitui a decomposição sobre a série inteira do task antigo.
   * AVALIAÇÃO: shards de TESTE (sem rótulos) com rotulagem EM RUNTIME
@@ -42,7 +42,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.environ.get("PIPELINE_DIR", "."))
 from config import CFG                                       # noqa: E402
 from model_hybrid import HybridWLSTMix                       # noqa: E402
-from step4_5_labels import label_windows_batch, fuse_labels  # noqa: E402
+from step4_5_labels_v2 import label_windows_batch, fuse_labels  # noqa: E402
 from step6_train import (WindowedPTDataset, LazyWindowedPTDataset,  # noqa: E402
                          run_epoch)
 from fed_monitor import RunMonitor                           # noqa: E402
