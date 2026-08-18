@@ -1,85 +1,162 @@
 #!/usr/bin/env bash
 # =============================================================================
-# smoke_test_fed.sh — Smoke test de rodada(s) federada(s) — VERSÃO ALINHADA
-# aos arquivos reais do projeto (pyproject "raspberry-deployment",
-# run_config com tag/max-shards, node-config com data-root/metrics-dir).
+# smoke_test_fed.sh — Smoke test da rodada federada
 #
-# Infra: 1 servidor + 5 Raspberry Pi, mesma rede local, SEM TLS (decisão
-# registrada). Flower >= 1.21 (SuperLink + SuperNode). flwr testado nos
-# dispositivos: 1.33.0 — confirme flags com `flower-superlink --help`.
+# Infra: 1 servidor (agregador) + 5 Raspberry Pi 5 clientes, IPs fixos, mesma
+# rede local, SEM TLS (decisão registrada). Flower >= 1.21 (SuperLink +
+# SuperNode); flwr 1.33.0 nos dispositivos — confirme as flags com
+# `flower-superlink --help` e `flower-supernode --help` antes de rodar.
 #
-# O smoke valida: [1] 5 SuperNodes conectam e R rodadas completam;
+# DADOS: storage COMPARTILHADO (TrueNAS) montado nos Pis. A partição de cada
+# cliente NÃO vem do caminho, vem do `pi=N` no --node-config, que o task.py
+# resolve via country_map.PI_BUCKETS (o mesmo índice do --pi do
+# train_local_pi.py). Sem isso, os 5 clientes treinariam no dataset inteiro.
+#
+# TEMPO ESPERADO DO SMOKE: pelas medições do centralizado no Pi 5
+# (GoiEner, 15 shards: 21522s e 15075s, razão 10:7 => 48-144 s por
+# shard-época), MAX_SHARDS=2 com 1 época e 1 rodada custa ~5-15 min por
+# cliente. Não é necessário limitar janelas por shard.
+#
+# O smoke valida: [1] 5 SuperNodes conectam e a rodada completa;
 # [2] v0 carrega com strict=True; [3] best_model_global.pth é gravado;
-# [4] cada Pi grava loss_smoke.jsonl / progress_smoke.json /
-#     summary_smoke.json / confusion_matrix_smoke.json (com wall_time_s);
+# [4] cada Pi grava loss/progress/summary/confusion_matrix com wall_time_s;
 # [5] smoke_report.py consolida e extrapola o ETA do treino completo.
 # =============================================================================
 set -euo pipefail
 
 # ------------------------- AJUSTE AQUI ---------------------------------------
-SERVER_IP="${SERVER_IP:-192.168.0.10}"      # IP fixo do servidor
-PIS=("pi1" "pi2" "pi3" "pi4" "pi5")         # hostnames/aliases SSH dos Pis
-APP_DIR="${APP_DIR:-$HOME/Tupa-Masters/scripts_tupa}"   # dir do pyproject.toml
-PIPELINE_DIR="${PIPELINE_DIR:-$APP_DIR}"    # exigido pelo task.py nos Pis
-FEDERATION="raspberry-deployment"            # nome real no pyproject.toml
-TAG="smoke"
-DATA_ROOT_PI="${DATA_ROOT_PI:-/home/pi/tupa_data}"      # partição em cada Pi
+SERVER_IP="${SERVER_IP:-192.168.0.10}"      # IP fixo do agregador
+PIS=("pi1" "pi2" "pi3" "pi4" "pi5")         # aliases SSH, na ORDEM dos índices
+APP_DIR="${APP_DIR:-$HOME/Tupa-Masters/scripts_tupa}"     # dir do pyproject (servidor)
+APP_DIR_PI="${APP_DIR_PI:-/home/pi/Tupa-Masters/scripts_tupa}"
+PIPELINE_DIR_PI="${PIPELINE_DIR_PI:-$APP_DIR_PI}"
+WLSTMIX_DIR_PI="${WLSTMIX_DIR_PI:-/home/pi/W-LSTMix}"     # contém models/W_LSTMix.py
+FEDERATION="raspberry-deployment"
+
+# Raiz dos dados no mount compartilhado (o "$REAL" dos seus comandos).
+# task.py procura <DATA_ROOT>/02_windows/<CFG.resolution>/{train,test}/**.pt
+DATA_ROOT="${DATA_ROOT:-/mnt/juliana-truenas/EnergyBench-Anomaly}"
 METRICS_DIR_PI="${METRICS_DIR_PI:-/home/pi/tupa_metrics}"
-V0_PATH="${V0_PATH:-}"                       # ex.: .../04_models/v0_real/best_model.pth
-# Smoke: 1 rodada, 1 época local, 2 shards por cliente — minutos, não horas.
-RUN_CONFIG="num-server-rounds=1 local-epochs=1 max-shards=2 tag=\"$TAG\""
+
+# Checkpoint v0 — caminho LOCAL DO SERVIDOR (é ele que carrega o v0).
+#   V0REAL=$SYNTH/04_models/v0_real/best_model.pth
+#   V0BOTH=$SYNTH/04_models/v0_final/best_model.pth
+V0_PATH="${V0_PATH:-}"
+
+TAG="${TAG:-smoke}"
+ROUNDS="${ROUNDS:-1}"
+MAX_SHARDS="${MAX_SHARDS:-2}"     # smoke=2; run completo=15 (= centralizado)
+MAX_WINDOWS="${MAX_WINDOWS:-0}"   # 0 = shard inteiro (só depuração usa >0)
+LOCAL_EPOCHS="${LOCAL_EPOCHS:-1}"
+
+RUN_CONFIG="num-server-rounds=$ROUNDS local-epochs=$LOCAL_EPOCHS \
+max-shards=$MAX_SHARDS max-windows=$MAX_WINDOWS tag=\"$TAG\""
 [ -n "$V0_PATH" ] && RUN_CONFIG="$RUN_CONFIG v0-path=\"$V0_PATH\""
 # -----------------------------------------------------------------------------
 
 usage() {
   cat <<EOF
-Uso: $0 {localsim|superlink|supernodes|run|collect|report|all}
+Uso: $0 {preflight|superlink|supernodes|run|collect|report|all}
 
-  localsim    (servidor) ensaio com 5 supernós SIMULADOS (federação default)
-              — valide isto ANTES de tocar nos Pis (passo já previsto no plano)
+  preflight   (servidor) confere mount, shards train/test JÁ FILTRADOS por
+              pi, env vars, import do task.py e o v0 com strict=True
   superlink   (servidor) sobe o SuperLink em modo --insecure
-  supernodes  (servidor) sobe via SSH um SuperNode em cada Pi
-  run         (servidor) dispara o run federado com config de smoke
-  collect     (servidor) traz por rsync os artefatos do fed_monitor dos Pis
+  supernodes  (servidor) sobe via SSH um SuperNode em cada Pi, com pi=N
+  run         (servidor) dispara o run federado
+  collect     (servidor) traz por rsync os artefatos do fed_monitor
   report      (servidor) consolida e extrapola ETA (smoke_report.py)
-  all         supernodes -> run -> collect -> report (SuperLink já ativo)
+  all         preflight -> supernodes -> run -> collect -> report
+              (SuperLink já ativo em outro terminal)
+
+Variáveis úteis: SERVER_IP DATA_ROOT V0_PATH TAG ROUNDS MAX_SHARDS
+                 LOCAL_EPOCHS APP_DIR_PI WLSTMIX_DIR_PI
 EOF
   exit 1
 }
 
-localsim() {
-  cd "$APP_DIR"
-  echo "[smoke] ensaio local-sim (5 supernós simulados): $RUN_CONFIG"
-  PIPELINE_DIR="$PIPELINE_DIR" flwr run . --run-config "$RUN_CONFIG" --stream
+# Conta os shards que o task.py REALMENTE verá para um dado pi — usa a
+# própria função do task.py, não um find aproximado, para que o preflight
+# valide o mesmo critério de filtragem que a execução vai usar.
+_contar_shards_pi() {
+  local pi_alias="$1" idx="$2"
+  ssh "$pi_alias" "cd ${APP_DIR_PI} && PIPELINE_DIR=${PIPELINE_DIR_PI} \
+    WLSTMIX_DIR=${WLSTMIX_DIR_PI} python3 -c \"
+import task
+from pathlib import Path
+r = Path('${DATA_ROOT}')
+tr = task._load_local('train', r, ${idx})
+te = task._load_local('test',  r, ${idx})
+print(f'train={len(tr)} test={len(te)} res={task.CFG.resolution}')
+\""
+}
+
+preflight() {
+  local falhou=0 idx=0
+  echo "[preflight] DATA_ROOT=${DATA_ROOT}"
+  for pi in "${PIS[@]}"; do
+    idx=$((idx + 1))
+    echo -n "  ${pi} (pi=${idx}): "
+    if out=$(_contar_shards_pi "$pi" "$idx" 2>&1); then
+      echo "$out"
+      case "$out" in
+        *"train=0 "*) echo "    [ERRO] nenhum shard de TREINO após o filtro "\
+          "de partição — confira o mount e country_map.PI_BUCKETS[$idx]";
+          falhou=1 ;;
+      esac
+      case "$out" in
+        *"test=0"*) echo "    [ERRO] nenhum shard de TESTE — sem ele não há "\
+          "test_loss e best_model_global.pth NUNCA é gravado"; falhou=1 ;;
+      esac
+    else
+      echo "FALHOU"; echo "$out" | sed 's/^/    /'; falhou=1
+    fi
+  done
+
+  if [ -n "$V0_PATH" ]; then
+    echo "[preflight] v0 com strict=True (servidor): $V0_PATH"
+    (cd "$APP_DIR" && python3 -c "
+import torch, task
+m = task.get_model(task.load_config(), torch.device('cpu'))
+m.load_state_dict(torch.load('$V0_PATH', map_location='cpu'), strict=True)
+print('  v0 OK')") || { echo "  [ERRO] v0 incompatível com HybridWLSTMix"; falhou=1; }
+  else
+    echo "[preflight] V0_PATH vazio — o run partiria de pesos ALEATÓRIOS."
+  fi
+
+  [ "$falhou" -eq 0 ] || { echo "[preflight] FALHOU — corrija antes de rodar."; exit 1; }
+  echo "[preflight] tudo OK."
 }
 
 superlink() {
   echo "[smoke] subindo SuperLink em ${SERVER_IP} (sem TLS)…"
-  # Portas padrão do Flower: 9092 (fleet/SuperNodes), 9093 (exec/`flwr run`)
-  # — o pyproject aponta address=servidor:9093.
+  # 9092 = fleet (SuperNodes); 9093 = exec (`flwr run`, no pyproject).
   flower-superlink --insecure
 }
 
 supernodes() {
+  local idx=0
   for pi in "${PIS[@]}"; do
-    echo "[smoke] iniciando SuperNode em ${pi}…"
-    ssh "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR} && \
-      PIPELINE_DIR=${PIPELINE_DIR} nohup flower-supernode --insecure \
+    idx=$((idx + 1))
+    echo "[smoke] iniciando SuperNode em ${pi} com pi=${idx}…"
+    ssh "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
+      PIPELINE_DIR=${PIPELINE_DIR_PI} WLSTMIX_DIR=${WLSTMIX_DIR_PI} \
+      setsid nohup flower-supernode --insecure \
         --superlink ${SERVER_IP}:9092 \
-        --node-config \"data-root='${DATA_ROOT_PI}' metrics-dir='${METRICS_DIR_PI}'\" \
-        > supernode_${TAG}.log 2>&1 & echo PID=\$!"
+        --node-config \"data-root='${DATA_ROOT}' pi=${idx} metrics-dir='${METRICS_DIR_PI}'\" \
+        > supernode_${TAG}.log 2>&1 < /dev/null & echo PID=\$!"
   done
   echo "[smoke] aguarde ~10 s e confira no log do SuperLink se os 5 nós registraram."
 }
 
 run() {
   cd "$APP_DIR"
-  echo "[smoke] disparando: flwr run . ${FEDERATION} --run-config '${RUN_CONFIG}'"
+  echo "[smoke] flwr run . ${FEDERATION} --run-config '${RUN_CONFIG}'"
   T0=$(date +%s)
   flwr run . "$FEDERATION" --run-config "$RUN_CONFIG" --stream
   T1=$(date +%s)
   echo "[smoke] run concluído em $((T1-T0)) s (ponta a ponta, servidor)."
-  # o server_app também grava run_summary_${TAG}.json com o wall interno
+  echo "[smoke] overhead de agregação ≈ (esse valor − max wall_time_s dos "
+  echo "        Pis) / ${ROUNDS} — use como --agg-overhead-s no report."
 }
 
 collect() {
@@ -90,29 +167,32 @@ collect() {
     rsync -av "${pi}:${METRICS_DIR_PI}/" "metrics_${TAG}/${pi}/" || \
       echo "[aviso] rsync falhou para ${pi}"
   done
-  echo "[smoke] artefatos em metrics_${TAG}/<pi>/ (inclui confusion_matrix_${TAG}.json)"
+  echo "[smoke] artefatos em metrics_${TAG}/<pi>/"
 }
 
 report() {
   cd "$APP_DIR"
-  # --full-units: total de SHARDS do treino completo por Pi (mesma unidade
-  # do RunMonitor.tick no task.py). Conte com:
-  #   ssh piN "find ${DATA_ROOT_PI}/02_windows -path '*/train/*.pt' | wc -l"
-  python3 scripts_tupa/smoke_report.py \
+  # --full-units: nº de SHARDS de treino do run COMPLETO por host — mesma
+  # unidade do RunMonitor.tick(). Com MAX_SHARDS=15 no run completo, é
+  # simplesmente 15 para todos os hosts (o teto vira o total efetivo).
+  python3 smoke_report.py \
     --summaries "metrics_${TAG}/*/summary_${TAG}.json" \
     --json-out "smoke_report_${TAG}.json" "$@"
-  python3 scripts_tupa/plot_loss.py \
-    --inputs "metrics_${TAG}/*/loss_${TAG}*.jsonl" \
-    --out "plots_${TAG}" --fmt svg pdf --smooth 5
+  if [ -f plot_loss.py ]; then
+    python3 plot_loss.py --inputs "metrics_${TAG}/*/loss_${TAG}*.jsonl" \
+      --out "plots_${TAG}" --fmt svg pdf --smooth 5
+  else
+    echo "[aviso] plot_loss.py ausente — gráficos não gerados."
+  fi
 }
 
 case "${1:-}" in
-  localsim)   localsim ;;
+  preflight)  preflight ;;
   superlink)  superlink ;;
   supernodes) supernodes ;;
   run)        run ;;
   collect)    collect ;;
   report)     shift; report "$@" ;;
-  all)        supernodes; sleep 12; run; collect; report ;;
+  all)        preflight; supernodes; sleep 12; run; collect; report ;;
   *)          usage ;;
 esac
