@@ -2,6 +2,7 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 def plot_confusion_matrix_from_dict(data,
                                     group_names=('Verdadeiro Negativo', 'Falso Positivo', 'Falso Negativo', 'Verdadeiro Positivo'),
@@ -49,36 +50,36 @@ def plot_confusion_matrix_from_dict(data,
     # 4. Plotagem com Seaborn
     fig, ax = plt.subplots(figsize=figsize)
 
-    sns.heatmap(cf, annot=box_labels, fmt="", cmap=cmap, cbar=cbar, cbar_kws={'shrink': box_aspect * 1.6} if cbar else None, # Ajusta a barra lateral para acompanhar a altura do gráfico
+    sns.heatmap(cf, annot=box_labels, fmt="", cmap=cmap, cbar=False, cbar_kws={'shrink': box_aspect * 1.6} if cbar else None, # Ajusta a barra lateral para acompanhar a altura do gráfico
         xticklabels=categories, yticklabels=categories, linewidths=0.8, linecolor='black', ax=ax)
 
     # Reduz a altura dos quadrantes em relação à largura (0.5 = altura é metade da largura)
     ax.set_box_aspect(box_aspect)
 
     # 5. Adiciona a barra de cores alinhada EXATAMENTE com a altura da matriz
-    # if cbar:
-    #     cax = inset_axes(
-    #         ax, 
-    #         width="3.5%",          # Largura da barra de cores
-    #         height="100%",         # 100% da altura da matriz
-    #         loc='lower left',
-    #         bbox_to_anchor=(1.03, 0., 1, 1), # Posiciona a 3% de distância da borda direita da matriz
-    #         bbox_transform=ax.transAxes, 
-    #         borderpad=0
-    #     )
-    #     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=cf.min(), vmax=cf.max()))
-    #     sm.set_array([])
-    #     fig.colorbar(sm, cax=cax)
+    if cbar:
+        cax = inset_axes(
+            ax, 
+            width="3.5%",          # Largura da barra de cores
+            height="100%",         # 100% da altura da matriz
+            loc='lower left',
+            bbox_to_anchor=(1.03, 0., 1, 1), # Posiciona a 3% de distância da borda direita da matriz
+            bbox_transform=ax.transAxes, 
+            borderpad=0
+        )
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=cf.min(), vmax=cf.max()))
+        sm.set_array([])
+        fig.colorbar(sm, cax=cax)
 
     # Eixos e Títulos
-    plt.ylabel('Rótulo Real')
-    plt.xlabel('Rótulo Predito' + stats_text)
+    ax.set_ylabel('Rótulo Real')
+    ax.set_xlabel('Rótulo Predito' + stats_text)
 
     # Define o título (usa a 'tag' do dicionário se nenhum título for passado)
     plot_title = title if title else f"Matriz de Confusão: {data.get('tag', '')}"
-    plt.title(plot_title)
+    ax.set_title(plot_title)
 
-    plt.tight_layout()
+    # plt.savefig('matriz_confusao_alinhada.png', bbox_inches='tight', dpi=150)
     plt.show()
 
 
