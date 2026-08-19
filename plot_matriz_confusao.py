@@ -9,8 +9,9 @@ def plot_confusion_matrix_from_dict(data,
                                     count=True,
                                     percent=True,
                                     cbar=True,
-                                    figsize=(7, 6),
+                                    figsize=(6.5, 4.5),
                                     cmap='binary',
+                                    box_aspect=0.5, # Define a proporção (altura / largura) dos quadrantes
                                     title=None):
     """
     Gera a Matriz de Confusão a partir do dicionário de entrada com as métricas.
@@ -46,10 +47,30 @@ def plot_confusion_matrix_from_dict(data,
                   f"F1 Score={f1_score:0.3f}")
 
     # 4. Plotagem com Seaborn
-    plt.figure(figsize=figsize)
-    sns.heatmap(cf, annot=box_labels, fmt="", cmap=cmap, cbar=cbar,
-                xticklabels=categories, yticklabels=categories, linewidths=0.8, linecolor='black')
+    fig, ax = plt.subplots(figsize=figsize)
 
+    sns.heatmap(cf, annot=box_labels, fmt="", cmap=cmap, cbar=cbar, cbar_kws={'shrink': box_aspect * 1.6} if cbar else None, # Ajusta a barra lateral para acompanhar a altura do gráfico
+        xticklabels=categories, yticklabels=categories, linewidths=0.8, linecolor='black', ax=ax)
+
+    # Reduz a altura dos quadrantes em relação à largura (0.5 = altura é metade da largura)
+    ax.set_box_aspect(box_aspect)
+
+    # 5. Adiciona a barra de cores alinhada EXATAMENTE com a altura da matriz
+    # if cbar:
+    #     cax = inset_axes(
+    #         ax, 
+    #         width="3.5%",          # Largura da barra de cores
+    #         height="100%",         # 100% da altura da matriz
+    #         loc='lower left',
+    #         bbox_to_anchor=(1.03, 0., 1, 1), # Posiciona a 3% de distância da borda direita da matriz
+    #         bbox_transform=ax.transAxes, 
+    #         borderpad=0
+    #     )
+    #     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=cf.min(), vmax=cf.max()))
+    #     sm.set_array([])
+    #     fig.colorbar(sm, cax=cax)
+
+    # Eixos e Títulos
     plt.ylabel('Rótulo Real')
     plt.xlabel('Rótulo Predito' + stats_text)
 
@@ -116,6 +137,6 @@ data_input = {
 
 # Gerar o gráfico
 cenario="cen1"
-plot_confusion_matrix_from_dict(data_input[cenario], title=data_input[cenario]["titulo"], cmap='crest')
+plot_confusion_matrix_from_dict(data_input[cenario], title=data_input[cenario]["titulo"], cmap='crest', box_aspect=0.4)
 
 # escalas de cor (cmap): binary, Reds, Blues, crest, viridis, coolwarm, magma, cividis, inferno, plasma, cubehelix, rocket, icefire
