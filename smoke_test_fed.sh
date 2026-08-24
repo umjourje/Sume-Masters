@@ -25,23 +25,25 @@
 set -euo pipefail
 
 # ------------------------- AJUSTE AQUI ---------------------------------------
-SERVER_IP="${SERVER_IP:-192.168.0.10}"      # IP fixo do agregador
+SERVER_IP="${SERVER_IP:-172.28.254.64}"      # IP fixo do agregador
 PIS=("pi1" "pi2" "pi3" "pi4" "pi5")         # aliases SSH, na ORDEM dos índices
-APP_DIR="${APP_DIR:-$HOME/Tupa-Masters/scripts_tupa}"     # dir do pyproject (servidor)
-APP_DIR_PI="${APP_DIR_PI:-/home/pi/Tupa-Masters/scripts_tupa}"
+APP_DIR="${APP_DIR:-/mnt/juliana-truenas/Sume-Masters/scripts_tupa}"     # dir do pyproject (servidor)
+APP_DIR_PI="${APP_DIR_PI:-$HOME/source/Sume-Masters/scripts_tupa}"
 PIPELINE_DIR_PI="${PIPELINE_DIR_PI:-$APP_DIR_PI}"
-WLSTMIX_DIR_PI="${WLSTMIX_DIR_PI:-/home/pi/W-LSTMix}"     # contém models/W_LSTMix.py
+WLSTMIX_DIR_PI="${WLSTMIX_DIR_PI:-$HOME/source/Sume-Masters/models}"     # contém models/W_LSTMix.py
 FEDERATION="raspberry-deployment"
 
 # Raiz dos dados no mount compartilhado (o "$REAL" dos seus comandos).
 # task.py procura <DATA_ROOT>/02_windows/<CFG.resolution>/{train,test}/**.pt
 DATA_ROOT="${DATA_ROOT:-/mnt/juliana-truenas/EnergyBench-Anomaly}"
-METRICS_DIR_PI="${METRICS_DIR_PI:-/home/pi/tupa_metrics}"
+METRICS_DIR_PI="${METRICS_DIR_PI:-/home/pi/sume_metrics}"
 
 # Checkpoint v0 — caminho LOCAL DO SERVIDOR (é ele que carrega o v0).
-#   V0REAL=$SYNTH/04_models/v0_real/best_model.pth
-#   V0BOTH=$SYNTH/04_models/v0_final/best_model.pth
-V0_PATH="${V0_PATH:-}"
+SYNTH="/mnt/juliana-truenas/Synth-EnergyBench-Anomaly"
+V0REAL="{$SYNTH/04_models/v0_real/best_model.pth}"
+V0BOTH="{$SYNTH/04_models/v0_final/best_model.pth}"
+# Both Real+Sintético
+V0_PATH="${V0_PATH:-$V0BOTH}"
 
 TAG="${TAG:-smoke}"
 ROUNDS="${ROUNDS:-1}"
