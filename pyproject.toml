@@ -21,7 +21,7 @@ clientapp = "client_app:app"
 num-server-rounds = 10
 local-epochs = 1
 lr = 0.001
-v0-path = "/caminho/para/04_models/v0_real/best_model.pth"
+v0-path = "/mnt/juliana-truenas/Synth-EnergyBench-Anomaly/04_models/v0_final/best_model.pth"
 # ---- NOVO (smoke test + observabilidade) ----
 # tag: identifica o run; nomeia loss_<tag>.jsonl, summary_<tag>.json,
 #      confusion_matrix_<tag>.json (Pis) e run_summary_<tag>.json (servidor).
@@ -50,5 +50,5 @@ options.num-supernodes = 5
 # instalada do Flower — em algumas versões é necessário `insecure = true`
 # aqui e/ou a flag --insecure no flower-superlink/flower-supernode.
 [tool.flwr.federations.raspberry-deployment]
-address = "servidor:9093"
+address = "172.28.254.64:9093"
 insecure = true
