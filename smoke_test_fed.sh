@@ -21,6 +21,11 @@
 # [2] v0 carrega com strict=True; [3] best_model_global.pth é gravado;
 # [4] cada Pi grava loss/progress/summary/confusion_matrix com wall_time_s;
 # [5] smoke_report.py consolida e extrapola o ETA do treino completo.
+#
+# PYTHONS: servidor e Pis usam venvs DIFERENTES, em caminhos DIFERENTES.
+# Nunca crave um caminho de python solto no meio do script — use sempre
+# $PYTHON_SERVER (roda local, no servidor) ou $PYTHON_PI (roda via ssh,
+# dentro dos Pis). Ver bloco de variáveis abaixo.
 # =============================================================================
 set -euo pipefail
 
@@ -33,15 +38,28 @@ PIPELINE_DIR_PI="${PIPELINE_DIR_PI:-$APP_DIR_PI}"
 WLSTMIX_DIR_PI="${WLSTMIX_DIR_PI:-/home/jpiaz/source/Sume-Masters/models}"     # contém models/W_LSTMix.py
 FEDERATION="raspberry-deployment"
 
+# --- Interpretes Python — SEMPRE explicitados, servidor != Pis -------------
+# PYTHON_SERVER: venv usado LOCALMENTE no servidor (agregador), em preflight()
+# (checagem do v0 com strict=True) e em report() (smoke_report.py/plot_loss.py).
+PYTHON_SERVER="${PYTHON_SERVER:-/mnt/juliana-truenas/314-env/bin/python3}"
+# PYTHON_PI: venv usado via SSH DENTRO de cada Raspberry Pi (mesmo venv nos 5,
+# pois o ambiente é padronizado neles). Usado em _contar_shards_pi() e em
+# qualquer outro comando remoto que rode Python nos clientes.
+PYTHON_PI="${PYTHON_PI:-/home/jpiaz/source/312-env/bin/python3}"
+
 # Raiz dos dados no mount compartilhado (o "$REAL" dos seus comandos).
 # task.py procura <DATA_ROOT>/02_windows/<CFG.resolution>/{train,test}/**.pt
 DATA_ROOT="${DATA_ROOT:-/mnt/juliana-truenas/EnergyBench-Anomaly}"
 METRICS_DIR_PI="${METRICS_DIR_PI:-/home/jpiaz/sume_metrics}"
 
 # Checkpoint v0 — caminho LOCAL DO SERVIDOR (é ele que carrega o v0).
+# OBS: os "{ }" que existiam aqui antes eram bug — entravam como parte literal
+# do path (dava pra ver no log: "v0 ... {/mnt/.../best_model.pth}") e fariam
+# o torch.load falhar com FileNotFoundError mesmo depois de resolver o
+# ModuleNotFoundError.
 SYNTH="/mnt/juliana-truenas/Synth-EnergyBench-Anomaly"
-V0REAL="{$SYNTH/04_models/v0_real/best_model.pth}"
-V0BOTH="{$SYNTH/04_models/v0_final/best_model.pth}"
+V0REAL="$SYNTH/04_models/v0_real/best_model.pth"
+V0BOTH="$SYNTH/04_models/v0_final/best_model.pth"
 # Both Real+Sintético
 V0_PATH="${V0_PATH:-$V0BOTH}"
 
@@ -72,6 +90,8 @@ Uso: $0 {preflight|superlink|supernodes|run|collect|report|all}
 
 Variáveis úteis: SERVER_IP DATA_ROOT V0_PATH TAG ROUNDS MAX_SHARDS
                  LOCAL_EPOCHS APP_DIR_PI WLSTMIX_DIR_PI
+                 PYTHON_SERVER (interpretador local, servidor)
+                 PYTHON_PI     (interpretador via ssh, dentro dos Pis)
 EOF
   exit 1
 }
@@ -82,7 +102,7 @@ EOF
 _contar_shards_pi() {
   local pi_alias="$1" idx="$2"
   ssh "$pi_alias" "cd ${APP_DIR_PI} && PIPELINE_DIR=${PIPELINE_DIR_PI} \
-    WLSTMIX_DIR=${WLSTMIX_DIR_PI} /home/jpiaz/source/312-env/bin/python3 -c \"
+    WLSTMIX_DIR=${WLSTMIX_DIR_PI} ${PYTHON_PI} -c \"
 import task
 from pathlib import Path
 r = Path('${DATA_ROOT}')
@@ -95,6 +115,8 @@ print(f'train={len(tr)} test={len(te)} res={task.CFG.resolution}')
 preflight() {
   local falhou=0 idx=0
   echo "[preflight] DATA_ROOT=${DATA_ROOT}"
+  echo "[preflight] PYTHON_SERVER=${PYTHON_SERVER}"
+  echo "[preflight] PYTHON_PI=${PYTHON_PI}"
   for pi in "${PIS[@]}"; do
     idx=$((idx + 1))
     echo -n "  ${pi} (pi=${idx}): "
@@ -116,11 +138,26 @@ preflight() {
 
   if [ -n "$V0_PATH" ]; then
     echo "[preflight] v0 com strict=True (servidor): $V0_PATH"
-    (cd "$APP_DIR" && /mnt/juliana-truenas/314-env/bin/python3 -c "
+    # Checagem defensiva ANTES de chamar o Python: se task.py não estiver em
+    # APP_DIR, o erro abaixo deixa isso óbvio em vez de um ModuleNotFoundError
+    # genérico (causa mais comum: APP_DIR apontando pra pasta errada — ex.
+    # "scripts" quando o código está em "scripts_tupa").
+    if [ ! -f "${APP_DIR}/task.py" ]; then
+      echo "    [ERRO] ${APP_DIR}/task.py não existe."
+      echo "    Confira se APP_DIR='${APP_DIR}' é mesmo a pasta com o"
+      echo "    pyproject.toml + task.py no SERVIDOR (pode ser diferente de"
+      echo "    APP_DIR_PI='${APP_DIR_PI}', usado só nos Pis)."
+      falhou=1
+    elif (cd "$APP_DIR" && "$PYTHON_SERVER" -c "
 import torch, task
 m = task.get_model(task.load_config(), torch.device('cpu'))
 m.load_state_dict(torch.load('$V0_PATH', map_location='cpu'), strict=True)
-print('  v0 OK')") || { echo "  [ERRO] v0 incompatível com HybridWLSTMix"; falhou=1; }
+print('  v0 OK')"); then
+      :
+    else
+      echo "  [ERRO] v0 incompatível com HybridWLSTMix (ou PYTHON_SERVER='${PYTHON_SERVER}' incorreto)"
+      falhou=1
+    fi
   else
     echo "[preflight] V0_PATH vazio — o run partiria de pesos ALEATÓRIOS."
   fi
@@ -177,11 +214,12 @@ report() {
   # --full-units: nº de SHARDS de treino do run COMPLETO por host — mesma
   # unidade do RunMonitor.tick(). Com MAX_SHARDS=15 no run completo, é
   # simplesmente 15 para todos os hosts (o teto vira o total efetivo).
-  /home/jpiaz/source/312-env/bin/python3 smoke_report.py \
+  # (antes rodava com o python dos Pis por engano — corrigido para PYTHON_SERVER)
+  "$PYTHON_SERVER" smoke_report.py \
     --summaries "metrics_${TAG}/*/summary_${TAG}.json" \
     --json-out "smoke_report_${TAG}.json" "$@"
   if [ -f plot_loss.py ]; then
-    /home/jpiaz/source/312-env/bin/python3 plot_loss.py --inputs "metrics_${TAG}/*/loss_${TAG}*.jsonl" \
+    "$PYTHON_SERVER" plot_loss.py --inputs "metrics_${TAG}/*/loss_${TAG}*.jsonl" \
       --out "plots_${TAG}" --fmt svg pdf --smooth 5
   else
     echo "[aviso] plot_loss.py ausente — gráficos não gerados."
