@@ -116,7 +116,7 @@ preflight() {
 
   if [ -n "$V0_PATH" ]; then
     echo "[preflight] v0 com strict=True (servidor): $V0_PATH"
-    (cd "$APP_DIR" && /home/jpiaz/source/312-env/bin/python3 -c "
+    (cd "$APP_DIR" && /mnt/juliana-truenas/314-env/bin/python3 -c "
 import torch, task
 m = task.get_model(task.load_config(), torch.device('cpu'))
 m.load_state_dict(torch.load('$V0_PATH', map_location='cpu'), strict=True)
