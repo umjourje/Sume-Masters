@@ -62,13 +62,13 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 sys.path.insert(0, os.environ.get("PIPELINE_DIR", "."))
-from config import CFG                                       # noqa: E402
-from country_map import groups_for_pi                        # noqa: E402
-from model_hybrid import HybridWLSTMix                       # noqa: E402
-from step4_5_labels_v2 import label_windows_batch, fuse_labels  # noqa: E402
-from step6_train import (WindowedPTDataset, LazyWindowedPTDataset,  # noqa: E402
+from scripts.config import CFG                                       # noqa: E402
+from scripts.country_map import groups_for_pi                        # noqa: E402
+from scripts.model_hybrid import HybridWLSTMix                       # noqa: E402
+from scripts.step4_5_labels_v2 import label_windows_batch, fuse_labels  # noqa: E402
+from scripts.step6_train import (WindowedPTDataset, LazyWindowedPTDataset,  # noqa: E402
                          run_epoch)
-from fed_monitor import RunMonitor                           # noqa: E402
+from scripts.fed_monitor import RunMonitor                           # noqa: E402
 
 # Métricas do paper, com fallback (convenção do task original)
 try:
