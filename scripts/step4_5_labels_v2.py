@@ -29,8 +29,8 @@ import pandas as pd
 import torch
 from pathlib import Path
 from scripts.config import CFG
-from perf_log import RunLogger, _fmt_dur
-from step2_3_windows_wavelet_v2 import iter_windows, decompose_window  # p/ passo 8
+from scripts.perf_log import RunLogger, _fmt_dur
+from scripts.step2_3_windows_wavelet_v2 import iter_windows, decompose_window  # p/ passo 8
 
 try:
     from tqdm import tqdm
