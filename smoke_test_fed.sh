@@ -27,7 +27,7 @@ set -euo pipefail
 # ------------------------- AJUSTE AQUI ---------------------------------------
 SERVER_IP="${SERVER_IP:-172.28.254.64}"      # IP fixo do agregador
 PIS=("pi1" "pi2" "pi3" "pi4" "pi5")         # aliases SSH, na ORDEM dos índices
-APP_DIR="${APP_DIR:-/mnt/juliana-truenas/Sume-Masters/scripts_tupa}"     # dir do pyproject (servidor)
+APP_DIR="${APP_DIR:-/mnt/juliana-truenas/Sume-Masters/scripts}"     # dir do pyproject (servidor)
 APP_DIR_PI="${APP_DIR_PI:-/home/jpiaz/source/Sume-Masters/}"
 PIPELINE_DIR_PI="${PIPELINE_DIR_PI:-$APP_DIR_PI}"
 WLSTMIX_DIR_PI="${WLSTMIX_DIR_PI:-/home/jpiaz/source/Sume-Masters/models}"     # contém models/W_LSTMix.py
