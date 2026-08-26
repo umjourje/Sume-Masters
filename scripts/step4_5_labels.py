@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 import torch
 from pathlib import Path
-from config import CFG
+from scripts.config import CFG
 from step2_3_windows_wavelet import iter_windows, decompose_window
 
 try:

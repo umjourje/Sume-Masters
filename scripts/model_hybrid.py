@@ -42,7 +42,7 @@ except ModuleNotFoundError as e:         # mensagem acionável
         f"ou copie models/ e my_utils/ para {_here}. "
         f"Caminhos testados: {_CANDIDATES}") from e
 
-from config import CFG
+from scripts.config import CFG
 
 
 class HybridWLSTMix(nn.Module):

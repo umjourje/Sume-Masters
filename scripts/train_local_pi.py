@@ -260,7 +260,7 @@ class ShardCache:
         """UMA leitura do .pt bruto -> pacote(s) compacto(s)."""
         import numpy as np
         import torch
-        from config import CFG
+        from scripts.config import CFG
         pack = torch.load(pt_path, weights_only=False)
         B = CFG.backcast_length
         tr_idx, va_idx = particionar(pack["start"].numpy(),
@@ -419,7 +419,7 @@ def main() -> None:
     from step6_train import run_epoch                 # já validado
     from step4_5_labels_v2 import label_windows_batch
     from model_hybrid import HybridWLSTMix
-    from config import CFG
+    from scripts.config import CFG
     from fed_monitor import RunMonitor
 
     if a.threads > 0:

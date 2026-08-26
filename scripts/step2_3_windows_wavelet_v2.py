@@ -34,7 +34,7 @@ import pywt
 import torch
 from numpy.lib.stride_tricks import sliding_window_view
 
-from config import CFG
+from scripts.config import CFG
 from perf_log import RunLogger, _fmt_dur
 
 try:
