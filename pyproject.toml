@@ -29,6 +29,7 @@ tag = "default"
 # max-shards: 0 = treino completo; N>0 = amostra uniformemente espaçada
 #      de N shards por cliente (uso: smoke test, ex. max-shards=2).
 max-shards = 15
+max-windows = 0
 # metrics-dir NÃO fica aqui: é por dispositivo, declarado no node-config
 # de cada SuperNode:
 #   flower-supernode ... --node-config \
