@@ -16,7 +16,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from config import CFG
+from scripts.config import CFG
 
 
 def _fmt_dur(s: float) -> str:
