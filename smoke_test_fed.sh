@@ -82,7 +82,7 @@ EOF
 _contar_shards_pi() {
   local pi_alias="$1" idx="$2"
   ssh "$pi_alias" "cd ${APP_DIR_PI} && PIPELINE_DIR=${PIPELINE_DIR_PI} \
-    WLSTMIX_DIR=${WLSTMIX_DIR_PI} python3 -c \"
+    WLSTMIX_DIR=${WLSTMIX_DIR_PI} /home/jpiaz/source/312-env/bin/python3 -c \"
 import task
 from pathlib import Path
 r = Path('${DATA_ROOT}')
@@ -116,7 +116,7 @@ preflight() {
 
   if [ -n "$V0_PATH" ]; then
     echo "[preflight] v0 com strict=True (servidor): $V0_PATH"
-    (cd "$APP_DIR" && python3 -c "
+    (cd "$APP_DIR" && /home/jpiaz/source/312-env/bin/python3 -c "
 import torch, task
 m = task.get_model(task.load_config(), torch.device('cpu'))
 m.load_state_dict(torch.load('$V0_PATH', map_location='cpu'), strict=True)
@@ -177,11 +177,11 @@ report() {
   # --full-units: nº de SHARDS de treino do run COMPLETO por host — mesma
   # unidade do RunMonitor.tick(). Com MAX_SHARDS=15 no run completo, é
   # simplesmente 15 para todos os hosts (o teto vira o total efetivo).
-  python3 smoke_report.py \
+  /home/jpiaz/source/312-env/bin/python3 smoke_report.py \
     --summaries "metrics_${TAG}/*/summary_${TAG}.json" \
     --json-out "smoke_report_${TAG}.json" "$@"
   if [ -f plot_loss.py ]; then
-    python3 plot_loss.py --inputs "metrics_${TAG}/*/loss_${TAG}*.jsonl" \
+    /home/jpiaz/source/312-env/bin/python3 plot_loss.py --inputs "metrics_${TAG}/*/loss_${TAG}*.jsonl" \
       --out "plots_${TAG}" --fmt svg pdf --smooth 5
   else
     echo "[aviso] plot_loss.py ausente — gráficos não gerados."
