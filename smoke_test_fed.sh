@@ -32,6 +32,18 @@ set -euo pipefail
 # ------------------------- AJUSTE AQUI ---------------------------------------
 SERVER_IP="${SERVER_IP:-172.28.254.64}"      # IP fixo do agregador
 PIS=("pi1" "pi2" "pi3" "pi4" "pi5")         # aliases SSH, na ORDEM dos índices
+
+# Opções de ssh centralizadas: -n evita o hang clássico de ssh+comando
+# backgrounded (ver supernodes()); ConnectTimeout/ServerAlive* transformam
+# uma conexão travada (rede instável, sshd sobrecarregado, etc.) numa
+# FALHA RÁPIDA e visível em vez de um hang indefinido que só termina com
+# Ctrl+C manual — foi o padrão observado no smoke test (trava num Pi
+# diferente a cada tentativa, sinal de instabilidade, não bug fixo).
+# ⚠️ Os valores (10s/5s/3) são um ponto de partida razoável, não medidos
+# na sua rede — ajuste SSH_TIMEOUT_S se a rede real dos Pis for mais lenta
+# que isso em condições normais (para não confundir "lento" com "travado").
+SSH_TIMEOUT_S="${SSH_TIMEOUT_S:-10}"
+SSH_OPTS=(-n -o "ConnectTimeout=${SSH_TIMEOUT_S}" -o "ServerAliveInterval=5" -o "ServerAliveCountMax=3")
 APP_DIR="${APP_DIR:-/mnt/juliana-truenas/Sume-Masters/}"     # dir do pyproject (servidor)
 APP_DIR_PI="${APP_DIR_PI:-/home/jpiaz/source/Sume-Masters/}"
 PIPELINE_DIR_PI="${PIPELINE_DIR_PI:-$APP_DIR_PI}"
@@ -112,7 +124,7 @@ EOF
 # valide o mesmo critério de filtragem que a execução vai usar.
 _contar_shards_pi() {
   local pi_alias="$1" idx="$2"
-  ssh -n "$pi_alias" "cd ${APP_DIR_PI} && PIPELINE_DIR=${PIPELINE_DIR_PI} \
+  ssh "${SSH_OPTS[@]}" "$pi_alias" "cd ${APP_DIR_PI} && PIPELINE_DIR=${PIPELINE_DIR_PI} \
     WLSTMIX_DIR=${WLSTMIX_DIR_PI} ${PYTHON_PI} -c \"
 import task
 from pathlib import Path
@@ -151,7 +163,7 @@ preflight() {
   idx=0
   for pi in "${PIS[@]}"; do
     idx=$((idx + 1))
-    if ssh -n "$pi" "test -x '${SUPERNODE_BIN_PI}'" 2>/dev/null; then
+    if ssh "${SSH_OPTS[@]}" "$pi" "test -x '${SUPERNODE_BIN_PI}'" 2>/dev/null; then
       : # OK, silencioso — não precisa poluir a saída para o caso feliz
     else
       echo "    [ERRO] ${pi}: ${SUPERNODE_BIN_PI} não existe ou não é"
@@ -170,7 +182,7 @@ preflight() {
     # antes evita repetir o ciclo "sobe 5, morre 5, lê 5 logs".
     local superexec_bin
     superexec_bin="$(dirname "${SUPERNODE_BIN_PI}")/flower-superexec"
-    if ! ssh -n "$pi" "test -x '${superexec_bin}'" 2>/dev/null; then
+    if ! ssh "${SSH_OPTS[@]}" "$pi" "test -x '${superexec_bin}'" 2>/dev/null; then
       echo "    [ERRO] ${pi}: ${superexec_bin} não existe. O"
       echo "    flower-supernode SOBE e morre logo em seguida tentando"
       echo "    lançar esse binário internamente (isolation=subprocess,"
@@ -264,18 +276,16 @@ supernodes() {
     # ("FileNotFoundError: ... 'flower-superexec'").
     # Fonte: https://flower.ai/docs/framework/1.33/en/ref-flower-network-communication.html
     #
-    # ssh -n (NOVO): sem isso, o ssh herda/encaminha o stdin do terminal
-    # onde este script roda. Combinado com "& echo $!" no comando remoto,
-    # isso é um gatilho clássico e não-determinístico de travamento do
-    # ssh (ele fica esperando o canal de stdin fechar, mesmo com o
-    # processo remoto corretamente daemonizado via setsid+nohup+</dev/null)
-    # — o processo remoto sobe e registra normalmente (o SuperLink
-    # confirma isso no log), só o ssh local é que não retorna o controle.
-    # -n redireciona o stdin do PRÓPRIO ssh de /dev/null, o que é
-    # diferente do "< /dev/null" já existente na linha abaixo (esse só
-    # vale para o comando remoto backgrounded, não para o ssh em si).
+    # SSH_OPTS (-n + ConnectTimeout/ServerAlive*): -n evita o hang clássico
+    # de ssh+comando backgrounded (o processo remoto sobe e registra
+    # normalmente — o SuperLink confirma isso no log — só o ssh local é
+    # que não retornava o controle). Os timeouts de keepalive cobrem o
+    # caso OUTRO observado depois: instabilidade de rede/SSH que trava a
+    # conexão em pontos variáveis (Pi diferente a cada tentativa) — agora
+    # isso vira falha rápida (${SSH_TIMEOUT_S}s) em vez de hang
+    # indefinido só resolvido com Ctrl+C manual.
     local pid
-    pid=$(ssh -n "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
+    pid=$(ssh "${SSH_OPTS[@]}" "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
       PIPELINE_DIR=${PIPELINE_DIR_PI} WLSTMIX_DIR=${WLSTMIX_DIR_PI} \
       PATH=$(dirname "${SUPERNODE_BIN_PI}"):\$PATH \
       setsid nohup ${SUPERNODE_BIN_PI} --insecure \
@@ -291,11 +301,11 @@ supernodes() {
   local falhou=0
   for entry in "${alias_pid[@]}"; do
     local pi="${entry%%:*}" pid="${entry##*:}"
-    if ssh -n "$pi" "kill -0 ${pid} 2>/dev/null"; then
+    if ssh "${SSH_OPTS[@]}" "$pi" "kill -0 ${pid} 2>/dev/null"; then
       echo "  ${pi}: PID ${pid} vivo após 5s — OK"
     else
       echo "  [ERRO] ${pi}: PID ${pid} MORREU logo após subir. Últimas linhas de supernode_${TAG}.log:"
-      ssh -n "$pi" "tail -n 20 ${APP_DIR_PI}/supernode_${TAG}.log" 2>&1 | sed 's/^/      /'
+      ssh "${SSH_OPTS[@]}" "$pi" "tail -n 20 ${APP_DIR_PI}/supernode_${TAG}.log" 2>&1 | sed 's/^/      /'
       falhou=1
     fi
   done
@@ -315,7 +325,7 @@ stop_supernodes() {
     # espera 2s, e só então SIGKILL no que sobrar — sem isso, um processo
     # preso pode nunca soltar a porta 9094 (ClientAppIo API) para a
     # próxima tentativa.
-    ssh -n "$pi" "
+    ssh "${SSH_OPTS[@]}" "$pi" "
       pids=\$(pgrep -f 'flower-supernode|flower-superexec' || true)
       if [ -n \"\$pids\" ]; then
         echo \"  encontrados: \$pids\"
