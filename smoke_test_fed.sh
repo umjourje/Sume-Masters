@@ -169,6 +169,31 @@ print('  v0 OK')"); then
 superlink() {
   echo "[smoke] subindo SuperLink em ${SERVER_IP} (sem TLS)…"
   # 9092 = fleet (SuperNodes); 9093 = exec (`flwr run`, no pyproject).
+  #
+  # IMPORTANTE (achado no smoke real, exit code 608): por padrão, o
+  # SuperLink LIGA a instalação automática de dependências do ServerApp em
+  # tempo de execução. Isso ignora completamente o venv ativo neste shell
+  # (o mesmo $PYTHON_SERVER já validado no preflight()) e recria, do zero,
+  # um ambiente isolado em $FLWR_HOME/runtime-envs/<run_id> via `uv sync`
+  # — no nosso caso baixando a stack CUDA inteira do torch (~2.5GB) e
+  # estourando o disco (/home/juliana.piaz fica no `/`, que está a 85%).
+  #
+  # Como o ambiente já foi testado e aprovado no preflight (import task.py
+  # + torch + strict=True do v0), não faz sentido reinstalar nada em
+  # tempo de execução: desativamos essa reinstalação e o ServerApp passa
+  # a rodar no MESMO Python já ativo aqui.
+  #
+  # Fonte (Flower 1.33, oficial):
+  # https://flower.ai/docs/framework/1.33/en/how-to-install-app-dependencies-at-runtime.html
+  # https://flower.ai/docs/framework/1.33/en/ref-exit-codes/608.html
+  #
+  # ⚠️ Isso só tem efeito se o SuperLink NÃO estiver rodando com
+  # `--isolation=process` (não é o caso aqui — este script sobe o
+  # SuperExec embutido, chamando só `flower-superlink`). Se um dia vocês
+  # passarem a rodar `flower-superexec` separado, o flag equivalente vai
+  # nesse comando, não aqui — confirme contra `flower-superexec --help`
+  # antes de assumir que ainda se aplica.
+  export FLWR_DISABLE_RUNTIME_DEPENDENCY_INSTALLATION="${FLWR_DISABLE_RUNTIME_DEPENDENCY_INSTALLATION:-1}"
   flower-superlink --insecure
 }
 
