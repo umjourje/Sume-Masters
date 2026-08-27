@@ -83,12 +83,16 @@ max-shards=$MAX_SHARDS max-windows=$MAX_WINDOWS tag=\"$TAG\""
 
 usage() {
   cat <<EOF
-Uso: $0 {preflight|superlink|supernodes|run|collect|report|all}
+Uso: $0 {preflight|superlink|supernodes|stop|run|collect|report|all}
 
   preflight   (servidor) confere mount, shards train/test JÁ FILTRADOS por
               pi, env vars, import do task.py e o v0 com strict=True
   superlink   (servidor) sobe o SuperLink em modo --insecure
   supernodes  (servidor) sobe via SSH um SuperNode em cada Pi, com pi=N
+  stop        (servidor) mata flower-supernode/flower-superexec em TODOS
+              os Pis — use antes de repetir 'supernodes' se uma tentativa
+              anterior travou/foi interrompida (Ctrl+C não mata o processo
+              remoto: setsid+nohup existem justamente para sobreviver a isso)
   run         (servidor) dispara o run federado
   collect     (servidor) traz por rsync os artefatos do fed_monitor
   report      (servidor) consolida e extrapola ETA (smoke_report.py)
@@ -108,7 +112,7 @@ EOF
 # valide o mesmo critério de filtragem que a execução vai usar.
 _contar_shards_pi() {
   local pi_alias="$1" idx="$2"
-  ssh "$pi_alias" "cd ${APP_DIR_PI} && PIPELINE_DIR=${PIPELINE_DIR_PI} \
+  ssh -n "$pi_alias" "cd ${APP_DIR_PI} && PIPELINE_DIR=${PIPELINE_DIR_PI} \
     WLSTMIX_DIR=${WLSTMIX_DIR_PI} ${PYTHON_PI} -c \"
 import task
 from pathlib import Path
@@ -147,7 +151,7 @@ preflight() {
   idx=0
   for pi in "${PIS[@]}"; do
     idx=$((idx + 1))
-    if ssh "$pi" "test -x '${SUPERNODE_BIN_PI}'" 2>/dev/null; then
+    if ssh -n "$pi" "test -x '${SUPERNODE_BIN_PI}'" 2>/dev/null; then
       : # OK, silencioso — não precisa poluir a saída para o caso feliz
     else
       echo "    [ERRO] ${pi}: ${SUPERNODE_BIN_PI} não existe ou não é"
@@ -166,7 +170,7 @@ preflight() {
     # antes evita repetir o ciclo "sobe 5, morre 5, lê 5 logs".
     local superexec_bin
     superexec_bin="$(dirname "${SUPERNODE_BIN_PI}")/flower-superexec"
-    if ! ssh "$pi" "test -x '${superexec_bin}'" 2>/dev/null; then
+    if ! ssh -n "$pi" "test -x '${superexec_bin}'" 2>/dev/null; then
       echo "    [ERRO] ${pi}: ${superexec_bin} não existe. O"
       echo "    flower-supernode SOBE e morre logo em seguida tentando"
       echo "    lançar esse binário internamente (isolation=subprocess,"
@@ -259,8 +263,19 @@ supernodes() {
     # SuperExec interno — confirmado no traceback do smoke test
     # ("FileNotFoundError: ... 'flower-superexec'").
     # Fonte: https://flower.ai/docs/framework/1.33/en/ref-flower-network-communication.html
+    #
+    # ssh -n (NOVO): sem isso, o ssh herda/encaminha o stdin do terminal
+    # onde este script roda. Combinado com "& echo $!" no comando remoto,
+    # isso é um gatilho clássico e não-determinístico de travamento do
+    # ssh (ele fica esperando o canal de stdin fechar, mesmo com o
+    # processo remoto corretamente daemonizado via setsid+nohup+</dev/null)
+    # — o processo remoto sobe e registra normalmente (o SuperLink
+    # confirma isso no log), só o ssh local é que não retorna o controle.
+    # -n redireciona o stdin do PRÓPRIO ssh de /dev/null, o que é
+    # diferente do "< /dev/null" já existente na linha abaixo (esse só
+    # vale para o comando remoto backgrounded, não para o ssh em si).
     local pid
-    pid=$(ssh "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
+    pid=$(ssh -n "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
       PIPELINE_DIR=${PIPELINE_DIR_PI} WLSTMIX_DIR=${WLSTMIX_DIR_PI} \
       PATH=$(dirname "${SUPERNODE_BIN_PI}"):\$PATH \
       setsid nohup ${SUPERNODE_BIN_PI} --insecure \
@@ -276,11 +291,11 @@ supernodes() {
   local falhou=0
   for entry in "${alias_pid[@]}"; do
     local pi="${entry%%:*}" pid="${entry##*:}"
-    if ssh "$pi" "kill -0 ${pid} 2>/dev/null"; then
+    if ssh -n "$pi" "kill -0 ${pid} 2>/dev/null"; then
       echo "  ${pi}: PID ${pid} vivo após 5s — OK"
     else
       echo "  [ERRO] ${pi}: PID ${pid} MORREU logo após subir. Últimas linhas de supernode_${TAG}.log:"
-      ssh "$pi" "tail -n 20 ${APP_DIR_PI}/supernode_${TAG}.log" 2>&1 | sed 's/^/      /'
+      ssh -n "$pi" "tail -n 20 ${APP_DIR_PI}/supernode_${TAG}.log" 2>&1 | sed 's/^/      /'
       falhou=1
     fi
   done
@@ -288,6 +303,33 @@ supernodes() {
     echo "[smoke] AVISO: pelo menos 1 SuperNode morreu no boot — corrija antes de prosseguir para 'run'."
   fi
   echo "[smoke] processos vivos != registrados no SuperLink — confira também o log do SuperLink (terminal 1) para confirmar que os nós de fato registraram na Fleet API."
+}
+
+stop_supernodes() {
+  local idx=0
+  for pi in "${PIS[@]}"; do
+    idx=$((idx + 1))
+    echo "[smoke] verificando/encerrando flower-supernode em ${pi}…"
+    # -n: mesmo motivo do resto do script (evita hang de ssh+background).
+    # SIGTERM primeiro (permite desconectar do SuperLink de forma limpa),
+    # espera 2s, e só então SIGKILL no que sobrar — sem isso, um processo
+    # preso pode nunca soltar a porta 9094 (ClientAppIo API) para a
+    # próxima tentativa.
+    ssh -n "$pi" "
+      pids=\$(pgrep -f 'flower-supernode|flower-superexec' || true)
+      if [ -n \"\$pids\" ]; then
+        echo \"  encontrados: \$pids\"
+        kill \$pids 2>/dev/null || true
+        sleep 2
+        pids2=\$(pgrep -f 'flower-supernode|flower-superexec' || true)
+        [ -n \"\$pids2\" ] && kill -9 \$pids2 2>/dev/null || true
+        echo '  encerrado.'
+      else
+        echo '  nenhum processo encontrado.'
+      fi
+    "
+  done
+  echo "[smoke] pronto — confira com: for p in ${PIS[*]}; do ssh \$p pgrep -af flower-supernode; done"
 }
 
 run() {
@@ -333,6 +375,7 @@ case "${1:-}" in
   preflight)  preflight ;;
   superlink)  superlink ;;
   supernodes) supernodes ;;
+  stop)       stop_supernodes ;;
   run)        run ;;
   collect)    collect ;;
   report)     shift; report "$@" ;;
