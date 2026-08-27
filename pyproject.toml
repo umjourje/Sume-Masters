@@ -51,5 +51,5 @@ options.num-supernodes = 5
 # instalada do Flower — em algumas versões é necessário `insecure = true`
 # aqui e/ou a flag --insecure no flower-superlink/flower-supernode.
 [tool.flwr.federations.raspberry-deployment]
-address = "172.28.254.64:9093"
+address = "127.0.0.1:9093"
 insecure = true
