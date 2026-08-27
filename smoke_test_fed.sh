@@ -199,17 +199,43 @@ superlink() {
 
 supernodes() {
   local idx=0
+  local -a alias_pid=()   # "pi:PID", para checar sobrevivência logo abaixo
   for pi in "${PIS[@]}"; do
     idx=$((idx + 1))
     echo "[smoke] iniciando SuperNode em ${pi} com pi=${idx}…"
-    ssh "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
+    # NOTA: este PID é do processo backgrounded DENTRO do SSH remoto — ele
+    # existe mesmo que o `flower-supernode` real morra logo em seguida
+    # (comando não encontrado, erro de import, porta inalcançável...).
+    # Por isso NUNCA confie só nele: a checagem de sobrevivência abaixo é
+    # que realmente prova alguma coisa.
+    local pid
+    pid=$(ssh "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
       PIPELINE_DIR=${PIPELINE_DIR_PI} WLSTMIX_DIR=${WLSTMIX_DIR_PI} \
       setsid nohup flower-supernode --insecure \
         --superlink ${SERVER_IP}:9092 \
         --node-config \"data-root='${DATA_ROOT}' pi=${idx} metrics-dir='${METRICS_DIR_PI}'\" \
-        > supernode_${TAG}.log 2>&1 < /dev/null & echo PID=\$!"
+        > supernode_${TAG}.log 2>&1 < /dev/null & echo \$!")
+    echo "  PID=${pid}"
+    alias_pid+=("${pi}:${pid}")
   done
-  echo "[smoke] aguarde ~10 s e confira no log do SuperLink se os 5 nós registraram."
+
+  echo "[smoke] aguardando 5 s para checar se os 5 processos sobreviveram ao boot…"
+  sleep 5
+  local falhou=0
+  for entry in "${alias_pid[@]}"; do
+    local pi="${entry%%:*}" pid="${entry##*:}"
+    if ssh "$pi" "kill -0 ${pid} 2>/dev/null"; then
+      echo "  ${pi}: PID ${pid} vivo após 5s — OK"
+    else
+      echo "  [ERRO] ${pi}: PID ${pid} MORREU logo após subir. Últimas linhas de supernode_${TAG}.log:"
+      ssh "$pi" "tail -n 20 ${APP_DIR_PI}/supernode_${TAG}.log" 2>&1 | sed 's/^/      /'
+      falhou=1
+    fi
+  done
+  if [ "$falhou" -ne 0 ]; then
+    echo "[smoke] AVISO: pelo menos 1 SuperNode morreu no boot — corrija antes de prosseguir para 'run'."
+  fi
+  echo "[smoke] processos vivos != registrados no SuperLink — confira também o log do SuperLink (terminal 1) para confirmar que os nós de fato registraram na Fleet API."
 }
 
 run() {
