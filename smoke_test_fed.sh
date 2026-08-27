@@ -158,6 +158,22 @@ preflight() {
       echo "      ssh ${pi} \"${PYTHON_PI} -m pip show flwr\""
       falhou=1
     fi
+    # flower-supernode roda em --isolation=subprocess por padrão e lança
+    # sozinho um `flower-superexec` (achado via PATH, não caminho
+    # completo) — se esse binário irmão não existir, o SuperNode morre
+    # DEPOIS de logar "Starting Flower SuperNode", o que só aparece no
+    # log do próprio Pi, nunca no preflight (até agora). Checar aqui
+    # antes evita repetir o ciclo "sobe 5, morre 5, lê 5 logs".
+    local superexec_bin
+    superexec_bin="$(dirname "${SUPERNODE_BIN_PI}")/flower-superexec"
+    if ! ssh "$pi" "test -x '${superexec_bin}'" 2>/dev/null; then
+      echo "    [ERRO] ${pi}: ${superexec_bin} não existe. O"
+      echo "    flower-supernode SOBE e morre logo em seguida tentando"
+      echo "    lançar esse binário internamente (isolation=subprocess,"
+      echo "    o padrão) — mesma família de bug do PATH, um nível mais"
+      echo "    fundo. Confira a instalação do flwr nesse venv."
+      falhou=1
+    fi
   done
 
   if [ -n "$V0_PATH" ]; then
@@ -232,9 +248,21 @@ supernodes() {
     # (comando não encontrado, erro de import, porta inalcançável...).
     # Por isso NUNCA confie só nele: a checagem de sobrevivência abaixo é
     # que realmente prova alguma coisa.
+    #
+    # PATH=...:$PATH (remoto, por isso o \$ escapado): o flower-supernode
+    # roda por padrão em --isolation=subprocess e, internamente, faz
+    # subprocess.Popen(['flower-superexec', ...]) SEM caminho completo —
+    # ele conta com o PATH do próprio processo pai para achar esse
+    # binário irmão no mesmo venv. Como a sessão SSH não-interativa não
+    # carrega esse PATH (mesmo causa raiz do bug anterior, um nível mais
+    # fundo), sem isso o SuperNode morre tentando subir seu próprio
+    # SuperExec interno — confirmado no traceback do smoke test
+    # ("FileNotFoundError: ... 'flower-superexec'").
+    # Fonte: https://flower.ai/docs/framework/1.33/en/ref-flower-network-communication.html
     local pid
     pid=$(ssh "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
       PIPELINE_DIR=${PIPELINE_DIR_PI} WLSTMIX_DIR=${WLSTMIX_DIR_PI} \
+      PATH=$(dirname "${SUPERNODE_BIN_PI}"):\$PATH \
       setsid nohup ${SUPERNODE_BIN_PI} --insecure \
         --superlink ${SERVER_IP}:9092 \
         --node-config \"data-root='${DATA_ROOT}' pi=${idx} metrics-dir='${METRICS_DIR_PI}'\" \
