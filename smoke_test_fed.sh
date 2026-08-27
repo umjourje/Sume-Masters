@@ -46,6 +46,13 @@ PYTHON_SERVER="${PYTHON_SERVER:-/mnt/juliana-truenas/314-env/bin/python3}"
 # pois o ambiente é padronizado neles). Usado em _contar_shards_pi() e em
 # qualquer outro comando remoto que rode Python nos clientes.
 PYTHON_PI="${PYTHON_PI:-/home/jpiaz/source/312-env/bin/python3}"
+# Binário do flower-supernode, MESMO venv de PYTHON_PI (console-scripts de
+# um venv ficam no mesmo bin/ do python3 dele). Caminho completo de
+# propósito: sessões SSH não-interativas costumam NÃO carregar o PATH que
+# ativa esse venv (pulam .bashrc), então um `flower-supernode` "pelado"
+# falha com "No such file or directory" mesmo com o venv certo instalado —
+# foi exatamente essa a causa raiz confirmada no smoke test.
+SUPERNODE_BIN_PI="${SUPERNODE_BIN_PI:-$(dirname "$PYTHON_PI")/flower-supernode}"
 
 # Raiz dos dados no mount compartilhado (o "$REAL" dos seus comandos).
 # task.py procura <DATA_ROOT>/02_windows/<CFG.resolution>/{train,test}/**.pt
@@ -136,6 +143,23 @@ preflight() {
     fi
   done
 
+  echo "[preflight] SUPERNODE_BIN_PI=${SUPERNODE_BIN_PI}"
+  idx=0
+  for pi in "${PIS[@]}"; do
+    idx=$((idx + 1))
+    if ssh "$pi" "test -x '${SUPERNODE_BIN_PI}'" 2>/dev/null; then
+      : # OK, silencioso — não precisa poluir a saída para o caso feliz
+    else
+      echo "    [ERRO] ${pi}: ${SUPERNODE_BIN_PI} não existe ou não é"
+      echo "    executável nesse Pi. Confira com:"
+      echo "      ssh ${pi} \"ls -la \$(dirname ${SUPERNODE_BIN_PI})\""
+      echo "    Se o venv existir mas o binário não, o flwr provavelmente"
+      echo "    não está instalado nesse venv — confira com:"
+      echo "      ssh ${pi} \"${PYTHON_PI} -m pip show flwr\""
+      falhou=1
+    fi
+  done
+
   if [ -n "$V0_PATH" ]; then
     echo "[preflight] v0 com strict=True (servidor): $V0_PATH"
     # Checagem defensiva ANTES de chamar o Python: se task.py não estiver em
@@ -211,7 +235,7 @@ supernodes() {
     local pid
     pid=$(ssh "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
       PIPELINE_DIR=${PIPELINE_DIR_PI} WLSTMIX_DIR=${WLSTMIX_DIR_PI} \
-      setsid nohup flower-supernode --insecure \
+      setsid nohup ${SUPERNODE_BIN_PI} --insecure \
         --superlink ${SERVER_IP}:9092 \
         --node-config \"data-root='${DATA_ROOT}' pi=${idx} metrics-dir='${METRICS_DIR_PI}'\" \
         > supernode_${TAG}.log 2>&1 < /dev/null & echo \$!")
