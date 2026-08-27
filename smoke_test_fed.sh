@@ -215,9 +215,9 @@ report() {
   # unidade do RunMonitor.tick(). Com MAX_SHARDS=15 no run completo, é
   # simplesmente 15 para todos os hosts (o teto vira o total efetivo).
   # (antes rodava com o python dos Pis por engano — corrigido para PYTHON_SERVER)
-  "$PYTHON_SERVER" smoke_report.py \
+  "$PYTHON_SERVER" scripts/smoke_report.py \
     --summaries "metrics_${TAG}/*/summary_${TAG}.json" \
-    --json-out "smoke_report_${TAG}.json" "$@"
+    --json-out "scripts/smoke_report_${TAG}.json" "$@"
   if [ -f plot_loss.py ]; then
     "$PYTHON_SERVER" plot_loss.py --inputs "metrics_${TAG}/*/loss_${TAG}*.jsonl" \
       --out "plots_${TAG}" --fmt svg pdf --smooth 5
