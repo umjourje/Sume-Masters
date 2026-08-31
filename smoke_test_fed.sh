@@ -397,13 +397,27 @@ stop_supernodes() {
     # IMPORTANTE (corrigido): antes, um SSH que falhasse aqui (Pi fora do
     # ar, por exemplo) derrubava o script inteiro via `set -e`. Agora o
     # `|| echo ...` isola a falha e o loop segue para os próximos Pis.
+    #
+    # IMPORTANTE #2 (corrigido — bug de self-match do pgrep): `pgrep -f`
+    # casa contra a LINHA DE COMANDO INTEIRA de cada processo. Como esta
+    # própria chamada SSH executa um `bash -c "... pgrep -f
+    # 'flower-supernode|flower-superexec' ..."`, a linha de comando desse
+    # bash -c CONTÉM literalmente o texto do padrão — e o pgrep encontrava
+    # a SI MESMO (visto no `status`: PID reportado era o `bash -c` da
+    # sessão SSH, não um SuperNode real). Aqui isso é ainda mais grave:
+    # se \$pids inclui o próprio processo, o `kill \$pids` pode encerrar a
+    # sessão SSH ANTES de matar o SuperNode de verdade. Fix: colchete em
+    # uma letra do padrão (`[f]lower-...`) — como regex ainda casa com o
+    # texto real "flower-...", mas não casa com o texto literal
+    # "[f]lower-..." que aparece na própria invocação do pgrep (truque
+    # clássico de `ps aux | grep '[f]oo'`).
     ssh "${SSH_OPTS[@]}" "$pi" "
-      pids=\$(pgrep -f 'flower-supernode|flower-superexec' || true)
+      pids=\$(pgrep -f '[f]lower-supernode|[f]lower-superexec' || true)
       if [ -n \"\$pids\" ]; then
         echo \"  encontrados: \$pids\"
         kill \$pids 2>/dev/null || true
         sleep 2
-        pids2=\$(pgrep -f 'flower-supernode|flower-superexec' || true)
+        pids2=\$(pgrep -f '[f]lower-supernode|[f]lower-superexec' || true)
         [ -n \"\$pids2\" ] && kill -9 \$pids2 2>/dev/null || true
         echo '  encerrado.'
       else
@@ -417,8 +431,8 @@ stop_supernodes() {
       fi
     " || echo "  [ERRO] não foi possível conectar via SSH em ${pi} para limpar — verifique esse Pi manualmente."
   done
-  echo "[smoke] pronto — confira com: '$0 status', ou manualmente:"
-  echo "        for p in ${PIS[*]}; do ssh \$p pgrep -af flower-supernode; done"
+  echo "[smoke] pronto — confira com: '$0 status', ou manualmente em cada Pi:"
+  echo "        pgrep -af '[f]lower-supernode|[f]lower-superexec'"
 }
 
 # manual(): NÃO orquestra nada via SSH — só imprime o comando pronto para
@@ -437,8 +451,12 @@ deixar órfão (diferente do modo orquestrado 'supernodes', que usa
 setsid+nohup de propósito para sobreviver a uma queda de SSH).
 
 Antes de rodar, garanta que não há SuperNode antigo vivo: rode
-'$0 stop' a partir do servidor, ou 'pgrep -af flower-supernode'
-direto em cada Pi.
+'$0 stop' a partir do servidor, ou direto em cada Pi:
+  pgrep -af '[f]lower-supernode|[f]lower-superexec'
+(o colchete em [f] evita que o próprio pgrep se encontre na lista —
+sem ele, 'pgrep -af flower-supernode' SEMPRE mostra "vivo", mesmo sem
+nenhum SuperNode rodando, porque a linha de comando do próprio pgrep
+contém o texto "flower-supernode" que ele está procurando.)
 =====================================================================
 
 --- Terminal do SERVIDOR (SuperLink) ---
@@ -468,6 +486,13 @@ EOF
 
 # status(): foto rápida (porta + processo + log) dos 5 Pis de uma vez,
 # via SSH curto e não-interativo — não precisa abrir 5 terminais com watch.
+#
+# ATENÇÃO ao padrão '[f]lower-supernode|...' abaixo: o `[f]` não é
+# enfeite. `pgrep -f` casa contra a linha de comando INTEIRA, e esta
+# própria chamada roda um `bash -c "... pgrep -af 'flower-supernode|...'
+# ..."` — sem o colchete, o pgrep encontra A SI MESMO (foi exatamente o
+# bug reportado: "processo vivo" mesmo com todos os SuperNodes já
+# parados manualmente). Mesmo truque em stop_supernodes() e watch_pi().
 status() {
   echo "[status] Verificando os 5 Pis (portas 909x, processos flower, log)…"
   local idx=0
@@ -478,7 +503,7 @@ status() {
       echo '[portas 909x]'
       ss -tulnp 2>/dev/null | grep -E ':909[0-9]' || echo '  (nenhuma escutando)'
       echo '[processos flower]'
-      pgrep -af 'flower-supernode|flower-superexec' || echo '  (nenhum processo)'
+      pgrep -af '[f]lower-supernode|[f]lower-superexec' || echo '  (nenhum processo)'
       echo '[últimas linhas: supernode_${TAG}.log]'
       tail -n 6 '${APP_DIR_PI}/supernode_${TAG}.log' 2>/dev/null || echo '  (log ainda não existe)'
     " 2>&1); then
@@ -504,7 +529,7 @@ watch_pi() {
   fi
   ssh -t -o "ConnectTimeout=${SSH_TIMEOUT_S}" "$pi" "watch -n 2 '
     echo \"--- portas 909x ---\"; ss -tulnp 2>/dev/null | grep -E \":909[0-9]\" || echo \"(nenhuma)\"
-    echo; echo \"--- processos flower ---\"; pgrep -af \"flower-supernode|flower-superexec\" || echo \"(nenhum)\"
+    echo; echo \"--- processos flower ---\"; pgrep -af \"[f]lower-supernode|[f]lower-superexec\" || echo \"(nenhum)\"
     echo; echo \"--- últimas linhas do log ---\"; tail -n 8 ${APP_DIR_PI}/supernode_${TAG}.log 2>/dev/null
   '"
 }
