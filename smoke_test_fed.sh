@@ -95,16 +95,33 @@ max-shards=$MAX_SHARDS max-windows=$MAX_WINDOWS tag=\"$TAG\""
 
 usage() {
   cat <<EOF
-Uso: $0 {preflight|superlink|supernodes|stop|run|collect|report|all}
+Uso: $0 {preflight|superlink|supernodes|stop|manual|status|watch|run|collect|report|all}
 
   preflight   (servidor) confere mount, shards train/test JÁ FILTRADOS por
               pi, env vars, import do task.py e o v0 com strict=True
   superlink   (servidor) sobe o SuperLink em modo --insecure
-  supernodes  (servidor) sobe via SSH um SuperNode em cada Pi, com pi=N
+  supernodes  (servidor) via SSH: primeiro MATA SuperNodes remanescentes em
+              TODOS os Pis (equivalente a 'stop', automático agora — é
+              exatamente isso que evita o "Port ... 9094 is already in
+              use"), depois sobe um SuperNode novo em cada um, com pi=N.
+              Se o SSH falhar em algum Pi, os demais continuam sendo
+              tentados (antes, um único Pi instável derrubava o script
+              INTEIRO por causa do 'set -e', deixando os Pis já subidos
+              órfãos — a causa raiz do bug relatado).
   stop        (servidor) mata flower-supernode/flower-superexec em TODOS
-              os Pis — use antes de repetir 'supernodes' se uma tentativa
-              anterior travou/foi interrompida (Ctrl+C não mata o processo
-              remoto: setsid+nohup existem justamente para sobreviver a isso)
+              os Pis. Chamado automaticamente no início de 'supernodes',
+              mas pode rodar sozinho a qualquer momento.
+  manual      NÃO executa nada — só imprime o comando exato para colar em
+              cada terminal (1 do servidor + 1 por Pi), sem passar pela
+              orquestração via SSH/nohup/setsid. Use quando quiser ver o
+              boot de cada nó ao vivo, na tela do próprio Pi.
+  status      (servidor) via SSH: para cada Pi, mostra porta 909x em uso,
+              processos flower vivos e as últimas linhas do log — uma
+              foto rápida de onde cada nó está travado, sem precisar
+              abrir terminal em cada Pi.
+  watch <pi>  (servidor) abre um 'watch' interativo DENTRO do Pi indicado
+              (porta + processos + log, atualizado a cada 2s). Ex.:
+              $0 watch pi3
   run         (servidor) dispara o run federado
   collect     (servidor) traz por rsync os artefatos do fed_monitor
   report      (servidor) consolida e extrapola ETA (smoke_report.py)
@@ -254,8 +271,21 @@ superlink() {
 }
 
 supernodes() {
+  # CORREÇÃO (causa raiz do "Port ... 9094 is already in use" nos 5 Pis):
+  # o `setsid nohup` abaixo existe de propósito para o SuperNode sobreviver
+  # a uma queda do SSH — só que isso também significa que, se o script
+  # morrer (Ctrl+C local, ou o `set -e` do topo abortando por causa de UM
+  # Pi instável), os SuperNodes já subidos ficam ÓRFÃOS, segurando a porta
+  # 9094 naquele Pi para sempre. Repita esse ciclo manualmente algumas
+  # vezes e os 5 Pis acabam com um órfão cada — exatamente o smoke test
+  # que falhou. Por isso agora SEMPRE limpamos antes de subir de novo.
+  echo "[smoke] limpando SuperNodes remanescentes em todos os Pis antes de subir novos"
+  echo "        (evita o 'Port ... 9094 is already in use' visto no smoke)…"
+  stop_supernodes
+  echo
+
   local idx=0
-  local -a alias_pid=()   # "pi:PID", para checar sobrevivência logo abaixo
+  local -a alias_pid=()   # "pi:PID" ou "pi:SSH_FAILED", para checar sobrevivência abaixo
   for pi in "${PIS[@]}"; do
     idx=$((idx + 1))
     echo "[smoke] iniciando SuperNode em ${pi} com pi=${idx}…"
@@ -270,7 +300,7 @@ supernodes() {
     # subprocess.Popen(['flower-superexec', ...]) SEM caminho completo —
     # ele conta com o PATH do próprio processo pai para achar esse
     # binário irmão no mesmo venv. Como a sessão SSH não-interativa não
-    # carrega esse PATH (mesmo causa raiz do bug anterior, um nível mais
+    # carrega esse PATH (mesma causa raiz do bug anterior, um nível mais
     # fundo), sem isso o SuperNode morre tentando subir seu próprio
     # SuperExec interno — confirmado no traceback do smoke test
     # ("FileNotFoundError: ... 'flower-superexec'").
@@ -284,35 +314,74 @@ supernodes() {
     # conexão em pontos variáveis (Pi diferente a cada tentativa) — agora
     # isso vira falha rápida (${SSH_TIMEOUT_S}s) em vez de hang
     # indefinido só resolvido com Ctrl+C manual.
+    #
+    # IMPORTANTE (corrigido): antes, se este `ssh` falhasse (timeout, host
+    # fora do ar), o `set -e` do topo do script matava o script INTEIRO
+    # aqui, sem sequer tentar os Pis seguintes — e os já subidos ficavam
+    # órfãos (ver comentário no topo da função). O `if/else` abaixo isola
+    # essa falha: o loop continua para os próximos Pis.
     local pid
-    pid=$(ssh "${SSH_OPTS[@]}" "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
+    if pid=$(ssh "${SSH_OPTS[@]}" "$pi" "mkdir -p ${METRICS_DIR_PI}; cd ${APP_DIR_PI} && \
       PIPELINE_DIR=${PIPELINE_DIR_PI} WLSTMIX_DIR=${WLSTMIX_DIR_PI} \
       PATH=$(dirname "${SUPERNODE_BIN_PI}"):\$PATH \
       setsid nohup ${SUPERNODE_BIN_PI} --insecure \
         --superlink ${SERVER_IP}:9092 \
         --node-config \"data-root='${DATA_ROOT}' pi=${idx} metrics-dir='${METRICS_DIR_PI}'\" \
-        > supernode_${TAG}.log 2>&1 < /dev/null & echo \$!")
-    echo "  PID=${pid}"
-    alias_pid+=("${pi}:${pid}")
+        > supernode_${TAG}.log 2>&1 < /dev/null & echo \$!"); then
+      echo "  PID=${pid}"
+      alias_pid+=("${pi}:${pid}")
+    else
+      echo "  [ERRO] ${pi}: SSH falhou ao disparar o SuperNode nesse Pi (timeout, host" \
+           "fora do ar etc. — ver mensagem do ssh acima, se houver)."
+      alias_pid+=("${pi}:SSH_FAILED")
+    fi
   done
 
-  echo "[smoke] aguardando 5 s para checar se os 5 processos sobreviveram ao boot…"
+  echo "[smoke] aguardando 5 s para checar se os processos sobreviveram ao boot…"
   sleep 5
   local falhou=0
   for entry in "${alias_pid[@]}"; do
     local pi="${entry%%:*}" pid="${entry##*:}"
+    if [ "$pid" = "SSH_FAILED" ]; then
+      echo "  [ERRO] ${pi}: nem chegou a subir — falha de SSH (ver acima)."
+      falhou=1
+      continue
+    fi
     if ssh "${SSH_OPTS[@]}" "$pi" "kill -0 ${pid} 2>/dev/null"; then
       echo "  ${pi}: PID ${pid} vivo após 5s — OK"
     else
       echo "  [ERRO] ${pi}: PID ${pid} MORREU logo após subir. Últimas linhas de supernode_${TAG}.log:"
-      ssh "${SSH_OPTS[@]}" "$pi" "tail -n 20 ${APP_DIR_PI}/supernode_${TAG}.log" 2>&1 | sed 's/^/      /'
+      local logtail
+      logtail=$(ssh "${SSH_OPTS[@]}" "$pi" "tail -n 20 ${APP_DIR_PI}/supernode_${TAG}.log" 2>&1)
+      echo "$logtail" | sed 's/^/      /'
+      # Diagnóstico automático — classifica pela assinatura já vista no
+      # smoke test real (ver comentários acima), para não precisar reler
+      # o log a olho toda vez.
+      case "$logtail" in
+        *"already in use"*)
+          echo "    >>> DIAGNÓSTICO: porta ClientAppIO (9094) ainda ocupada nesse Pi."
+          echo "        Rode: $0 status   (mostra quem está segurando a porta)"
+          echo "        ou:   $0 stop     (mata SuperNode/SuperExec remanescentes)" ;;
+        *"flower-superexec"*)
+          echo "    >>> DIAGNÓSTICO: flower-superexec não encontrado no PATH remoto —" \
+               "confira a instalação do flwr no venv desse Pi (${PYTHON_PI})." ;;
+        *"Connection refused"* | *"failed to connect"* | *"UNAVAILABLE"*)
+          echo "    >>> DIAGNÓSTICO: não alcançou o SuperLink em ${SERVER_IP}:9092 —" \
+               "confira se 'superlink' está de pé e se a rede permite esse Pi chegar lá." ;;
+        *"ModuleNotFoundError"* | *"ImportError"*)
+          echo "    >>> DIAGNÓSTICO: erro de import no venv desse Pi (PYTHON_PI=${PYTHON_PI})." ;;
+        *)
+          echo "    >>> DIAGNÓSTICO: assinatura não reconhecida automaticamente — leia o" \
+               "trecho de log acima." ;;
+      esac
       falhou=1
     fi
   done
   if [ "$falhou" -ne 0 ]; then
     echo "[smoke] AVISO: pelo menos 1 SuperNode morreu no boot — corrija antes de prosseguir para 'run'."
   fi
-  echo "[smoke] processos vivos != registrados no SuperLink — confira também o log do SuperLink (terminal 1) para confirmar que os nós de fato registraram na Fleet API."
+  echo "[smoke] processos vivos != registrados no SuperLink — confira também o log do SuperLink (terminal 1),"
+  echo "        ou rode '$0 status' para ver porta+processo+log dos 5 Pis de uma vez."
 }
 
 stop_supernodes() {
@@ -325,6 +394,9 @@ stop_supernodes() {
     # espera 2s, e só então SIGKILL no que sobrar — sem isso, um processo
     # preso pode nunca soltar a porta 9094 (ClientAppIo API) para a
     # próxima tentativa.
+    # IMPORTANTE (corrigido): antes, um SSH que falhasse aqui (Pi fora do
+    # ar, por exemplo) derrubava o script inteiro via `set -e`. Agora o
+    # `|| echo ...` isola a falha e o loop segue para os próximos Pis.
     ssh "${SSH_OPTS[@]}" "$pi" "
       pids=\$(pgrep -f 'flower-supernode|flower-superexec' || true)
       if [ -n \"\$pids\" ]; then
@@ -337,9 +409,104 @@ stop_supernodes() {
       else
         echo '  nenhum processo encontrado.'
       fi
-    "
+      restante=\$(ss -tulnp 2>/dev/null | grep ':9094 ' || true)
+      if [ -n \"\$restante\" ]; then
+        echo \"  [AVISO] porta 9094 AINDA ocupada nesse Pi após o kill:\"
+        echo \"    \$restante\"
+        echo '    (pode ser outro processo, não do Flower — confira manualmente com sudo lsof -i :9094)'
+      fi
+    " || echo "  [ERRO] não foi possível conectar via SSH em ${pi} para limpar — verifique esse Pi manualmente."
   done
-  echo "[smoke] pronto — confira com: for p in ${PIS[*]}; do ssh \$p pgrep -af flower-supernode; done"
+  echo "[smoke] pronto — confira com: '$0 status', ou manualmente:"
+  echo "        for p in ${PIS[*]}; do ssh \$p pgrep -af flower-supernode; done"
+}
+
+# manual(): NÃO orquestra nada via SSH — só imprime o comando pronto para
+# colar em cada terminal (1 do servidor + 1 por Pi). Use quando quiser ver
+# o boot de cada nó AO VIVO na própria tela dele, sem nohup/setsid no meio
+# escondendo erro, e sem depender do smoke test para propagar falha de SSH.
+manual() {
+  cat <<EOF
+=====================================================================
+MODO MANUAL — um comando por terminal, sem orquestração via SSH/nohup.
+Abra 6 terminais (1 servidor + 5 Pis, ex.: 'ssh pi1', 'ssh pi2', ...) e
+cole o bloco correspondente em cada um. Rodando em primeiro plano,
+qualquer erro (porta em uso, import, SuperLink inalcançável) aparece
+na hora, na tela daquele nó — Ctrl+C mata o processo de verdade, sem
+deixar órfão (diferente do modo orquestrado 'supernodes', que usa
+setsid+nohup de propósito para sobreviver a uma queda de SSH).
+
+Antes de rodar, garanta que não há SuperNode antigo vivo: rode
+'$0 stop' a partir do servidor, ou 'pgrep -af flower-supernode'
+direto em cada Pi.
+=====================================================================
+
+--- Terminal do SERVIDOR (SuperLink) ---
+export FLWR_DISABLE_RUNTIME_DEPENDENCY_INSTALLATION=1
+flower-superlink --insecure
+
+EOF
+  local idx=0
+  for pi in "${PIS[@]}"; do
+    idx=$((idx + 1))
+    cat <<EOF
+--- Terminal do ${pi} (pi=${idx}) ---
+mkdir -p ${METRICS_DIR_PI}
+cd ${APP_DIR_PI}
+export PIPELINE_DIR=${PIPELINE_DIR_PI}
+export WLSTMIX_DIR=${WLSTMIX_DIR_PI}
+export PATH="$(dirname "${SUPERNODE_BIN_PI}"):\$PATH"
+${SUPERNODE_BIN_PI} --insecure \\
+  --superlink ${SERVER_IP}:9092 \\
+  --node-config "data-root='${DATA_ROOT}' pi=${idx} metrics-dir='${METRICS_DIR_PI}'"
+
+EOF
+  done
+  echo "Depois que os 5 registrarem (confira no log do SuperLink), dispare o"
+  echo "'run' normalmente a partir do servidor: $0 run"
+}
+
+# status(): foto rápida (porta + processo + log) dos 5 Pis de uma vez,
+# via SSH curto e não-interativo — não precisa abrir 5 terminais com watch.
+status() {
+  echo "[status] Verificando os 5 Pis (portas 909x, processos flower, log)…"
+  local idx=0
+  for pi in "${PIS[@]}"; do
+    idx=$((idx + 1))
+    echo "----- ${pi} (pi=${idx}) -----"
+    if out=$(ssh "${SSH_OPTS[@]}" "$pi" "
+      echo '[portas 909x]'
+      ss -tulnp 2>/dev/null | grep -E ':909[0-9]' || echo '  (nenhuma escutando)'
+      echo '[processos flower]'
+      pgrep -af 'flower-supernode|flower-superexec' || echo '  (nenhum processo)'
+      echo '[últimas linhas: supernode_${TAG}.log]'
+      tail -n 6 '${APP_DIR_PI}/supernode_${TAG}.log' 2>/dev/null || echo '  (log ainda não existe)'
+    " 2>&1); then
+      echo "$out" | sed 's/^/  /'
+    else
+      echo "  [ERRO] não foi possível conectar via SSH em ${pi}."
+    fi
+    echo
+  done
+  echo "[status] Processo vivo != registrado na Fleet API — confirme também no log do SuperLink (terminal 1)."
+}
+
+# watch_pi(): abre um 'watch' interativo DENTRO do Pi indicado (porta +
+# processos + log, atualizado a cada 2s) — o pedido de "deixar um
+# terminal aberto olhando a conexão". Usa opções de ssh próprias (com -t
+# para alocar pty; SSH_OPTS tem -n, que é incompatível com terminal
+# interativo, por isso não é reaproveitado aqui).
+watch_pi() {
+  local pi="${1:-}"
+  if [ -z "$pi" ]; then
+    echo "Uso: $0 watch <alias-do-pi>   (ex.: $0 watch pi3)"
+    exit 1
+  fi
+  ssh -t -o "ConnectTimeout=${SSH_TIMEOUT_S}" "$pi" "watch -n 2 '
+    echo \"--- portas 909x ---\"; ss -tulnp 2>/dev/null | grep -E \":909[0-9]\" || echo \"(nenhuma)\"
+    echo; echo \"--- processos flower ---\"; pgrep -af \"flower-supernode|flower-superexec\" || echo \"(nenhum)\"
+    echo; echo \"--- últimas linhas do log ---\"; tail -n 8 ${APP_DIR_PI}/supernode_${TAG}.log 2>/dev/null
+  '"
 }
 
 run() {
@@ -386,6 +553,9 @@ case "${1:-}" in
   superlink)  superlink ;;
   supernodes) supernodes ;;
   stop)       stop_supernodes ;;
+  manual)     manual ;;
+  status)     status ;;
+  watch)      shift; watch_pi "${1:-}" ;;
   run)        run ;;
   collect)    collect ;;
   report)     shift; report "$@" ;;
