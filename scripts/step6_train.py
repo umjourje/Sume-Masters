@@ -360,10 +360,27 @@ def _loader(ds, shuffle, logger=None, force_workers0=False):
                       prefetch_factor=2 if w > 0 else None)
 
 
-def run_epoch(model, loader, mse, bce, device, scaler, optimizer=None):
+def run_epoch(model, loader, mse, bce, device, scaler, optimizer=None,
+             return_components: bool = False):
+    """Roda uma época (treino se optimizer!=None, senão avaliação) sobre
+    `loader`, otimizando/loggando o loss combinado forecast + BCE:
+
+        loss = l_fore + CFG.lambda_cls * bce(logits, ct)
+
+    return_components (NOVO, opt-in, default False): quando True, devolve
+    a tupla (loss_total, loss_bce) em vez de só loss_total. O QUE É
+    OTIMIZADO NÃO MUDA — o backward continua sobre `loss` (o total),
+    exatamente como antes; a única diferença é que a parcela pura de BCE
+    também passa a ser acumulada e devolvida, para quem quiser reportá-la
+    separadamente (ex.: task.py do ClientApp federado, como
+    train_bce_loss). Por ser opt-in com default False, todo chamador
+    existente que não passa esse argumento — train_local_pi.py, _fit(),
+    _fit_scale() logo abaixo — mantém o comportamento IDÊNTICO de antes
+    (recebe só o float do total), sem precisar de nenhuma mudança.
+    """
     training = optimizer is not None
     model.train(training)
-    tot, n = 0.0, 0
+    tot, tot_bce, n = 0.0, 0.0, 0
     amp = CFG.use_amp and device.type == "cuda"
     with torch.set_grad_enabled(training):
         for batch in loader:
@@ -377,7 +394,8 @@ def run_epoch(model, loader, mse, bce, device, scaler, optimizer=None):
                 l_t, l_s = mse(t_pred, tt), mse(s_pred, st)
                 ssum = l_t + l_s
                 l_fore = (l_s / ssum) * l_t + (l_t / ssum) * l_s
-                loss = l_fore + CFG.lambda_cls * bce(logits, ct)
+                l_bce = bce(logits, ct)
+                loss = l_fore + CFG.lambda_cls * l_bce
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 if amp:
@@ -388,8 +406,12 @@ def run_epoch(model, loader, mse, bce, device, scaler, optimizer=None):
                     loss.backward()
                     optimizer.step()
             tot += loss.item() * ti.size(0)
+            tot_bce += l_bce.item() * ti.size(0)
             n += ti.size(0)
-    return tot / max(n, 1)
+    avg_total = tot / max(n, 1)
+    if return_components:
+        return avg_total, tot_bce / max(n, 1)
+    return avg_total
 
 
 def _discover_shards(out_root, split="train"):

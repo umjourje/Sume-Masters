@@ -6,10 +6,10 @@ do repositório Tupã, acrescentando:
   1. Registro por rodada no TensorBoard do SERVIDOR:
        - métricas agregadas de treino e avaliação (train/*, evaluate/*);
        - métricas POR CLIENTE (clients/<id>/*), sem agregação;
-       - a curva de épocas locais (train_loss_epochs) de cada cliente,
-         projetada num eixo de passos global — resolvendo o ponto
-         sinalizado anteriormente: a lista NÃO entra na média do FedAvg,
-         é consumida aqui e removida antes da agregação.
+       - as curvas de épocas locais (train_loss_epochs, train_bce_loss_epochs)
+         de cada cliente, projetadas num eixo de passos global — resolvendo
+         o ponto sinalizado anteriormente: essas listas NÃO entram na média
+         do FedAvg, são consumidas aqui e removidas antes da agregação.
   2. Checkpoint do MELHOR modelo global (menor métrica de avaliação
      agregada, por padrão test_loss) — o análogo federado correto do
      early stopping/best_model.pth do train.py original do W-LSTMix.
@@ -33,8 +33,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 log = logging.getLogger("wlstmix.strategy")
 
-# Chaves que NÃO devem ser agregadas pelo FedAvg (listas/curvas locais)
-NON_AGGREGATABLE_KEYS = ("train_loss_epochs",)
+# Chaves que NÃO devem ser agregadas pelo FedAvg (listas/curvas locais).
+# CORREÇÃO: train_bce_loss_epochs entrou aqui junto com train_loss_epochs
+# (patch A do BCE isolado) — sem isso, o FedAvg tentaria fazer média
+# ponderada de uma LISTA como se fosse escalar, o mesmo tipo de erro que
+# já corrigimos para numpy.float32 em MetricRecord, só que do lado do
+# servidor em vez do cliente.
+NON_AGGREGATABLE_KEYS = ("train_loss_epochs", "train_bce_loss_epochs")
 
 
 def _client_id(msg: Message) -> str:
@@ -86,17 +91,30 @@ class TensorBoardFedAvg(FedAvg):
             metrics: MetricRecord = msg.content["metrics"]
             cid = _client_id(msg)
 
-            # (i) Curva de épocas locais -> eixo de passos global, por cliente
-            epochs_curve = metrics.get("train_loss_epochs")
-            if epochs_curve is not None:
+            # (i) Curvas de épocas locais -> eixo de passos global, por
+            # cliente. Genérico sobre NON_AGGREGATABLE_KEYS: cobre tanto
+            # train_loss_epochs quanto train_bce_loss_epochs (e qualquer
+            # outra curva que venha a ser adicionada) sem duplicar o loop.
+            for curve_key in NON_AGGREGATABLE_KEYS:
+                epochs_curve = metrics.get(curve_key)
+                if epochs_curve is None:
+                    continue
+                # "train_bce_loss_epochs" -> "train_bce_loss_epoch" no TB
+                tb_name = (curve_key[:-1] if curve_key.endswith("s")
+                          else curve_key)
                 for ep_idx, loss_val in enumerate(list(epochs_curve)):
                     global_step = (server_round - 1) * self.local_epochs + ep_idx
                     self.writer.add_scalar(
-                        f"clients/{cid}/train_loss_epoch", float(loss_val), global_step
+                        f"clients/{cid}/{tb_name}", float(loss_val), global_step
                     )
-                # (ii) Remove ANTES da agregação: listas não devem entrar na média
-                for key in NON_AGGREGATABLE_KEYS:
-                    metrics.pop(key, None)
+
+            # (ii) Remove ANTES da agregação: listas não devem entrar na
+            # média do FedAvg. CORRIGIDO: agora incondicional (antes só
+            # rodava dentro do "if epochs_curve is not None", então uma
+            # curva ausente numa rodada deixava a(s) outra(s) chave(s)
+            # vazar para a agregação sem proteção).
+            for key in NON_AGGREGATABLE_KEYS:
+                metrics.pop(key, None)
 
             # (iii) Escalares por cliente (sem agregação), indexados pela rodada
             for key, value in metrics.items():

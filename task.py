@@ -49,6 +49,16 @@ shard em loss_<tag>.jsonl e confusion_matrix_<tag>.json por cliente.
    SOBREPOSIÇÃO entre janelas vizinhas; um subconjunto esparso deixaria
    a cobertura cheia de buracos e distorceria precision/recall.
 
+3) TREINO — BCE isolado como métrica adicional (aditivo, não muda o que
+   é otimizado). `run_epoch` (scripts/step6_train.py) continua otimizando
+   o loss combinado forecast+BCE, exatamente como antes; ele só passou a
+   aceitar `return_components=True` para TAMBÉM devolver a parcela pura
+   de BCE, sem alterar o backward nem o valor de train_loss já existente.
+   Aqui essa parcela é acumulada por shard/época do mesmo jeito que
+   train_loss (média ponderada por nº de janelas) e exposta como
+   train_bce_loss / train_bce_loss_epochs — útil para acompanhar a
+   classificação isoladamente do erro de forecasting no TensorBoard.
+
 Requisito: PIPELINE_DIR no ambiente apontando para a pasta do pipeline
 (onde vivem config.py, step6_train.py, country_map.py, fed_monitor.py).
 """
@@ -208,6 +218,13 @@ def train(model: HybridWLSTMix, data_root: Path, device,
     train_local_pi.py usou (--max-shards 15 nos runs de referência), para
     que a diferença medida entre arquiteturas não se confunda com
     diferença de orçamento de dados.
+
+    BCE isolado (aditivo): pede a run_epoch() a parcela pura de
+    classificação via return_components=True. O QUE É OTIMIZADO NÃO MUDA
+    — o backward de run_epoch continua sobre o loss combinado
+    (forecast + CFG.lambda_cls * BCE), exatamente como antes. Só
+    passamos a acumular e reportar essa parcela separadamente, com a
+    MESMA ponderação por nº de janelas usada em train_loss.
     """
     pts = _amostrar_shards(_load_local("train", data_root, pi), max_shards)
     if not pts:
@@ -229,11 +246,11 @@ def train(model: HybridWLSTMix, data_root: Path, device,
     mon = RunMonitor(out_dir=mdir, tag=tag,
                      total_units=len(pts) * epochs,   # unidade do ETA: shard
                      progress_every=1)                # poucos shards/rodada
-    losses = []
+    losses, bce_losses = [], []
     with mon:
         gstep = 0
         for e in range(epochs):
-            soma = peso = 0.0
+            soma = peso = soma_bce = 0.0
             for k in rng.permutation(len(pts)):
                 ds = WindowedPTDataset(pts[k])          # 1 shard por vez
                 if not len(ds):
@@ -248,8 +265,10 @@ def train(model: HybridWLSTMix, data_root: Path, device,
                 loader = DataLoader(ds, batch_size=CFG.batch_size,
                                     shuffle=True, num_workers=0,
                                     pin_memory=device.type == "cuda")
-                l = run_epoch(model, loader, mse, bce, device, scaler, opt)
+                l, l_bce = run_epoch(model, loader, mse, bce, device, scaler,
+                                     opt, return_components=True)
                 soma += float(l) * len(ds)              # média ponderada real
+                soma_bce += float(l_bce) * len(ds)      # idem, só BCE
                 peso += len(ds)
                 mon.log_loss(float(l), step=gstep, stage="fit",
                              round=round_no, epoch=e,
@@ -258,11 +277,14 @@ def train(model: HybridWLSTMix, data_root: Path, device,
                 gstep += 1
                 del loader, ds
             losses.append(soma / max(peso, 1.0))
+            bce_losses.append(soma_bce / max(peso, 1.0))
 
     summary = mon.summary()
     return {
         "train_loss": float(losses[-1]),
+        "train_bce_loss": float(bce_losses[-1]),           # NOVO: BCE isolado
         "train_loss_epochs": [float(v) for v in losses],  # curva p/ TB
+        "train_bce_loss_epochs": [float(v) for v in bce_losses],  # NOVO
         "num-examples": n_total,                          # peso do FedAvg
         "n_shards": len(pts),
         **_monitor_metrics(summary),   # wall_time_s, CPU/RAM, unid/min
@@ -394,10 +416,11 @@ def evaluate(model: HybridWLSTMix, data_root: Path, device,
 
     return {
         "test_loss": float(np.mean(losses)),      # métrica de seleção
-        "cvrmse": cal_cvrmse(fp_, ft),            # forecasting (paper)
-        "nrmse": cal_nrmse(fp_, ft),
-        "mae": cal_mae(fp_, ft),
-        "mse": cal_mse(fp_, ft),
+        "cvrmse": float(cal_cvrmse(fp_, ft)),     # forecasting (paper) — cast
+        "nrmse": float(cal_nrmse(fp_, ft)),       # explícito: my_utils.metrics
+        "mae": float(cal_mae(fp_, ft)),           # (quando não é o fallback)
+        "mse": float(cal_mse(fp_, ft)),           # não garante tipo nativo, e
+                                                    # fp_/ft são float32 (torch).
         "f1": f1v,                                # classif.
         "precision": prec,
         "recall": rec,
