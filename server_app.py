@@ -6,6 +6,15 @@ do app) + o bloco do "v0" decidido neste chat: o modelo da rodada 1 NÃO é
 aleatório — são os pesos do treino no REAL (passo 6, --data-scope real,
 tag v0_real), carregados com strict=True.
 
+NOVO NESTA VERSÃO (3) — CORREÇÃO DE LOGGING: `logging.getLogger("wlstmix.
+server")`/`("wlstmix.strategy")` NUNCA produziam saída visível em `flwr run
+--stream` — só o logger chamado literalmente "flwr" tem o ConsoleHandler
+que alimenta o stream (confirmado lendo flwr.common.logger). Trocado por
+`flwr.common.log(NIVEL, msg, *args)` em todo lugar. Isso afeta TODAS as
+mensagens desta versão, inclusive as que já existiam antes (ex.: "v0
+carregado de %s", "novo melhor..." em strategy.py) — elas nunca apareceram
+em nenhum run anterior, não é regressão desta versão.
+
 NOVO NESTA VERSÃO (2): early stopping federado de verdade (patience sobre
 test_loss), via run-config 'patience' e 'min-delta'. Isso exigiu trocar
 `strategy.start(...)` por um laço manual round-a-round — `.start()` é um
@@ -60,18 +69,17 @@ TensorBoard: tensorboard --logdir tb_logs/server
 from __future__ import annotations
 
 import json
-import logging
 import time
+from logging import INFO, WARNING
 from pathlib import Path
 
 import torch
 from flwr.app import ArrayRecord, ConfigRecord, Context
+from flwr.common import log
 from flwr.serverapp import Grid, ServerApp
 
 import task                                   # mesmo diretório do app
 from strategy import TensorBoardFedAvg
-
-log = logging.getLogger("wlstmix.server")
 
 app = ServerApp()
 
@@ -107,10 +115,10 @@ def main(grid: Grid, context: Context) -> None:
     if v0 and Path(v0).exists():
         model.load_state_dict(torch.load(v0, map_location=device),
                               strict=True)
-        log.info("v0 carregado de %s", v0)
+        log(INFO, "v0 carregado de %s", v0)
     else:
-        log.warning("v0-path %r não encontrado — iniciando de pesos "
-                    "ALEATÓRIOS (ok só para ensaio).", v0)
+        log(WARNING, "v0-path %r não encontrado — iniciando de pesos "
+            "ALEATÓRIOS (ok só para ensaio).", v0)
 
     arrays = ArrayRecord(model.state_dict())
 
@@ -132,9 +140,11 @@ def main(grid: Grid, context: Context) -> None:
     # da ordem de chamadas do Strategy.start() oficial (ver docstring do
     # módulo para a fonte conferida): configure_train -> send_and_receive
     # -> aggregate_train -> configure_evaluate -> send_and_receive ->
-    # aggregate_evaluate. A ÚNICA adição real é o bloco de patience no
-    # fim do laço. train_config/evaluate_config vazios (ConfigRecord()):
-    # mesmo default do start() quando não fornecidos.
+    # aggregate_evaluate. As duas adições reais são: (1) o cronômetro por
+    # rodada (round_t0/round_dur, log logo abaixo do [ROUND X/Y]) e (2) o
+    # bloco de patience no fim do laço. train_config/evaluate_config
+    # vazios (ConfigRecord()): mesmo default do start() quando não
+    # fornecidos.
     # ------------------------------------------------------------------
     train_config = ConfigRecord()
     evaluate_config = ConfigRecord()
@@ -144,7 +154,11 @@ def main(grid: Grid, context: Context) -> None:
 
     try:
         for current_round in range(1, num_rounds + 1):
-            log.info("[ROUND %d/%d]", current_round, num_rounds)
+            round_t0 = time.time()
+            # NOVO: com o logger certo (flwr.common.log), esta linha
+            # finalmente aparece no `flwr run --stream` — é a resposta
+            # direta a "não sei qual round tá rodando".
+            log(INFO, "[ROUND %d/%d] iniciando…", current_round, num_rounds)
             rounds_executed = current_round
 
             # ---- treino (ClientApp-side) ----
@@ -158,7 +172,7 @@ def main(grid: Grid, context: Context) -> None:
             if agg_arrays is not None:
                 arrays = agg_arrays
             if agg_train_metrics is not None:
-                log.info("\t└──> Aggregated train MetricRecord: %s", agg_train_metrics)
+                log(INFO, "\t└──> Aggregated train MetricRecord: %s", agg_train_metrics)
 
             # ---- avaliação (ClientApp-side) ----
             evaluate_replies = grid.send_and_receive(
@@ -169,16 +183,25 @@ def main(grid: Grid, context: Context) -> None:
             agg_evaluate_metrics = strategy.aggregate_evaluate(
                 current_round, evaluate_replies)
             if agg_evaluate_metrics is not None:
-                log.info("\t└──> Aggregated evaluate MetricRecord: %s", agg_evaluate_metrics)
-                eval_history.append({
-                    "round": current_round,
-                    **{k: float(v) for k, v in agg_evaluate_metrics.items()
-                       if isinstance(v, (int, float))},
-                })
+                log(INFO, "\t└──> Aggregated evaluate MetricRecord: %s", agg_evaluate_metrics)
 
-            # ---- patience (NOVO — único trecho que não vem do start() original) ----
+            # NOVO: tempo desta rodada (treino+avaliação) — resposta direta
+            # a "o tempo de cada round". Loga e grava em eval_history mesmo
+            # se agg_evaluate_metrics vier None (falha de agregação), para
+            # não perder o dado de tempo por causa de uma métrica ausente.
+            round_dur = time.time() - round_t0
+            log(INFO, "[ROUND %d/%d] concluída em %.1f s (treino+avaliação)",
+                current_round, num_rounds, round_dur)
+            entry = {"round": current_round, "round_wall_s": round(round_dur, 1)}
+            if agg_evaluate_metrics is not None:
+                entry.update({k: float(v) for k, v in agg_evaluate_metrics.items()
+                             if isinstance(v, (int, float))})
+            eval_history.append(entry)
+
+            # ---- patience (único trecho que não vem do start() original) ----
             if patience > 0 and strategy.rounds_since_improvement >= patience:
-                log.info(
+                log(
+                    INFO,
                     "Early stopping na rodada %d/%d: %d rodada(s) seguidas "
                     "sem melhora de test_loss (paciência=%d, min-delta=%s).",
                     current_round, num_rounds,
@@ -187,7 +210,8 @@ def main(grid: Grid, context: Context) -> None:
                 stopped_early = True
                 break
     except KeyboardInterrupt:
-        log.warning(
+        log(
+            WARNING,
             "Interrompido manualmente na rodada %d/%d — salvando o que já "
             "foi treinado até aqui (final_model_global.pth) e o "
             "best_model_global.pth do melhor checkpoint já gravado.",
@@ -213,7 +237,7 @@ def main(grid: Grid, context: Context) -> None:
         "min_delta": min_delta,
         "local_epochs": local_epochs,
         "v0_path": v0,
-        "eval_history": eval_history,
+        "eval_history": eval_history,   # cada item já tem round_wall_s
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     sp = Path(f"run_summary_{tag}.json")
@@ -221,8 +245,8 @@ def main(grid: Grid, context: Context) -> None:
     sp_tmp.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     sp_tmp.replace(sp)
 
-    log.info("Execução concluída em %.1f s (%.1f s/rodada, %d/%d rodadas%s): "
-             "final_model_global.pth (última rodada), "
-             "best_model_global.pth (melhor rodada) e %s salvos.",
-             wall, summary["wall_time_per_round_s"], rounds_executed, num_rounds,
-             " — parou cedo" if stopped_early else "", sp)
+    log(INFO, "Execução concluída em %.1f s (%.1f s/rodada, %d/%d rodadas%s): "
+        "final_model_global.pth (última rodada), "
+        "best_model_global.pth (melhor rodada) e %s salvos.",
+        wall, summary["wall_time_per_round_s"], rounds_executed, num_rounds,
+        " — parou cedo" if stopped_early else "", sp)

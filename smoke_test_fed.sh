@@ -122,6 +122,10 @@ Uso: $0 {preflight|superlink|supernodes|stop|manual|status|watch|run|collect|rep
   watch <pi>  (servidor) abre um 'watch' interativo DENTRO do Pi indicado
               (porta + processos + log, atualizado a cada 2s). Ex.:
               $0 watch pi3
+  progress <pi>  (servidor) abre um 'watch' DENTRO do Pi indicado sobre
+              progress_<TAG>*.json — a mesma observabilidade do
+              train_local_pi.py (RunMonitor/fed_monitor), já escrita por
+              task.py em cada rodada. Ex.: $0 progress pi1
   run         (servidor) dispara o run federado
   collect     (servidor) traz por rsync os artefatos do fed_monitor
   report      (servidor) consolida e extrapola ETA (smoke_report.py)
@@ -534,11 +538,48 @@ watch_pi() {
   '"
 }
 
+# progress(): acompanha ao vivo o(s) progress_<TAG>*.json que o RunMonitor
+# (fed_monitor.py) já escreve dentro de train()/evaluate() do task.py — a
+# MESMA classe usada no train_local_pi.py. Não inventa nomes de campo: só
+# despeja o JSON cru (formatado, se python3 estiver disponível), porque
+# ainda não confirmamos o schema exato do RunMonitor deste projeto.
+# Casa por glob 'progress_*TAG*' para pegar tanto o progress do treino
+# (tag=TAG) quanto o da avaliação (tag=TAG_eval), sem precisar saber qual
+# sufixo exato o RunMonitor usa.
+progress() {
+  local pi="${1:-}"
+  if [ -z "$pi" ]; then
+    echo "Uso: $0 progress <alias-do-pi>   (ex.: $0 progress pi1)"
+    exit 1
+  fi
+  ssh -t -o "ConnectTimeout=${SSH_TIMEOUT_S}" "$pi" "watch -n 2 '
+    shopt -s nullglob
+    arquivos=(${METRICS_DIR_PI}/progress_*${TAG}*.json)
+    if [ \${#arquivos[@]} -eq 0 ]; then
+      echo \"(nenhum progress_*${TAG}*.json em ${METRICS_DIR_PI} ainda)\"
+    else
+      for f in \"\${arquivos[@]}\"; do
+        echo \"=== \$f ===\"
+        cat \"\$f\" 2>/dev/null | python3 -m json.tool 2>/dev/null || cat \"\$f\" 2>/dev/null
+        echo
+      done
+    fi
+  '"
+}
+
 run() {
   cd "$APP_DIR"
   echo "[smoke] flwr run . ${FEDERATION} --run-config '${RUN_CONFIG}'"
+  echo "[smoke] saída também gravada em server_run_${TAG}.log — dá pra"
+  echo "        acompanhar de outro terminal com: tail -f ${APP_DIR}/server_run_${TAG}.log"
   T0=$(date +%s)
-  flwr run . "$FEDERATION" --run-config "$RUN_CONFIG" --stream
+  # tee: mantém a saída ao vivo NESTE terminal (como antes) e também grava
+  # em arquivo, para acompanhar (ou conferir depois) de outro terminal sem
+  # precisar deixar este aberto. set -o pipefail (já ativo no topo do
+  # script) garante que um `flwr run` com erro ainda propague seu próprio
+  # exit code através do pipe.
+  flwr run . "$FEDERATION" --run-config "$RUN_CONFIG" --stream \
+    2>&1 | tee "server_run_${TAG}.log"
   T1=$(date +%s)
   echo "[smoke] run concluído em $((T1-T0)) s (ponta a ponta, servidor)."
   echo "[smoke] overhead de agregação ≈ (esse valor − max wall_time_s dos "
@@ -581,6 +622,7 @@ case "${1:-}" in
   manual)     manual ;;
   status)     status ;;
   watch)      shift; watch_pi "${1:-}" ;;
+  progress)   shift; progress "${1:-}" ;;
   run)        run ;;
   collect)    collect ;;
   report)     shift; report "$@" ;;

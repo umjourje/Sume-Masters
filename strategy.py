@@ -23,15 +23,27 @@ template gerado por `flwr new` na SUA versão instalada antes de rodar.
 
 from __future__ import annotations
 
-import logging
+from logging import INFO
 from typing import Iterable, Optional
 
 import torch
 from flwr.app import ArrayRecord, Message, MetricRecord
+from flwr.common import log
 from flwr.serverapp.strategy import FedAvg
 from torch.utils.tensorboard import SummaryWriter
 
-log = logging.getLogger("wlstmix.strategy")
+# ATENÇÃO (achado durante o run de patience): `logging.getLogger("qualquer
+# nome próprio").info(...)` NUNCA aparece no terminal do `flwr run
+# --stream`. Só o logger chamado literalmente "flwr" tem um ConsoleHandler
+# conectado (flwr.common.logger.FLOWER_LOGGER) — é dele que vêm as linhas
+# "INFO :      configure_train: ..." que você já vê. Por isso as mensagens
+# desta estratégia (inclusive as JÁ EXISTENTES antes desta correção, como
+# o antigo "Rodada %d: novo melhor...") nunca apareceram — não é bug do
+# patience, é logging morto desde a primeira versão. Confirmado lendo o
+# código-fonte de flwr.common.logger:
+# https://flower.ai/docs/framework/_modules/flwr/common/logger.html
+# Fix: usar flwr.common.log (= logging.getLogger("flwr").log) em vez de
+# logging.getLogger(__name__).
 
 # Chaves que NÃO devem ser agregadas pelo FedAvg (listas/curvas locais).
 # CORREÇÃO: train_bce_loss_epochs entrou aqui junto com train_loss_epochs
@@ -192,7 +204,8 @@ class TensorBoardFedAvg(FedAvg):
                         self._latest_arrays.to_torch_state_dict(), tmp)
                     import os as _os
                     _os.replace(tmp, self.checkpoint_path)
-                    log.info(
+                    log(
+                        INFO,
                         "Rodada %d: novo melhor %s=%.6f — checkpoint salvo em %s",
                         server_round, self.selection_metric, current,
                         self.checkpoint_path,
@@ -202,7 +215,8 @@ class TensorBoardFedAvg(FedAvg):
                     )
                 else:
                     self.rounds_since_improvement += 1
-                    log.info(
+                    log(
+                        INFO,
                         "Rodada %d: %s=%.6f não melhorou o melhor (%.6f) — "
                         "%d rodada(s) sem melhora",
                         server_round, self.selection_metric, current,
