@@ -68,6 +68,7 @@ class TensorBoardFedAvg(FedAvg):
         selection_metric: str = "test_loss",   # métrica agregada de avaliação
         lower_is_better: bool = True,
         local_epochs: int = 1,                 # p/ eixo global da curva de épocas
+        min_delta: float = 0.0,                # NOVO: tolerância de ruído p/ "melhorou"
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -76,8 +77,16 @@ class TensorBoardFedAvg(FedAvg):
         self.selection_metric = selection_metric
         self.lower_is_better = lower_is_better
         self.local_epochs = local_epochs
+        self.min_delta = min_delta
         self._best: Optional[float] = None
         self._latest_arrays: Optional[ArrayRecord] = None  # p/ salvar no melhor round
+        # NOVO: contador de rodadas consecutivas SEM melhora de
+        # selection_metric, exposto para o laço manual de server_app.py
+        # decidir patience — mantido AQUI (não em server_app.py) para não
+        # duplicar a lógica de "melhorou ou não" (que já mora aqui, junto
+        # de _best/selection_metric/lower_is_better/min_delta). Se algum
+        # dia mudar o critério de melhora, muda num lugar só.
+        self.rounds_since_improvement: int = 0
 
     # ------------------------------------------------------------------
     # TREINO: log por cliente + remoção de chaves não agregáveis + agregação
@@ -164,13 +173,18 @@ class TensorBoardFedAvg(FedAvg):
             current = agg_metrics.get(self.selection_metric)
             if current is not None and self._latest_arrays is not None:
                 current = float(current)
+                # min_delta: mesma semântica do --min-delta do
+                # train_local_pi.py — evita que ruído de 4ª/5ª casa
+                # decimal seja contado como "melhora" e zere a paciência
+                # indefinidamente sem progresso real.
                 improved = (
                     self._best is None
-                    or (self.lower_is_better and current < self._best)
-                    or (not self.lower_is_better and current > self._best)
+                    or (self.lower_is_better and current < self._best - self.min_delta)
+                    or (not self.lower_is_better and current > self._best + self.min_delta)
                 )
                 if improved:
                     self._best = current
+                    self.rounds_since_improvement = 0
                     # Escrita ATÔMICA (padrão do pipeline): .tmp + rename —
                     # um kill no meio nunca corrompe o melhor checkpoint.
                     tmp = str(self.checkpoint_path) + ".tmp"
@@ -185,6 +199,14 @@ class TensorBoardFedAvg(FedAvg):
                     )
                     self.writer.add_scalar(
                         f"evaluate/best_{self.selection_metric}", current, server_round
+                    )
+                else:
+                    self.rounds_since_improvement += 1
+                    log.info(
+                        "Rodada %d: %s=%.6f não melhorou o melhor (%.6f) — "
+                        "%d rodada(s) sem melhora",
+                        server_round, self.selection_metric, current,
+                        self._best, self.rounds_since_improvement,
                     )
 
         self.writer.flush()
