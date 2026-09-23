@@ -87,9 +87,12 @@ ROUNDS="${ROUNDS:-1}"
 MAX_SHARDS="${MAX_SHARDS:-2}"     # smoke=2; run completo=15 (= centralizado)
 MAX_WINDOWS="${MAX_WINDOWS:-0}"   # 0 = shard inteiro (só depuração usa >0)
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-1}"
+PATIENCE="${PATIENCE:-0}"        # 0 = early stopping desligado (default da lib)
+MIN_DELTA="${MIN_DELTA:-0.0}"
 
 RUN_CONFIG="num-server-rounds=$ROUNDS local-epochs=$LOCAL_EPOCHS \
-max-shards=$MAX_SHARDS max-windows=$MAX_WINDOWS tag=\"$TAG\""
+max-shards=$MAX_SHARDS max-windows=$MAX_WINDOWS tag=\"$TAG\" \
+patience=$PATIENCE min-delta=$MIN_DELTA"
 [ -n "$V0_PATH" ] && RUN_CONFIG="$RUN_CONFIG v0-path=\"$V0_PATH\""
 # -----------------------------------------------------------------------------
 
