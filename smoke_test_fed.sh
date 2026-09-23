@@ -26,6 +26,18 @@
 # Nunca crave um caminho de python solto no meio do script — use sempre
 # $PYTHON_SERVER (roda local, no servidor) ou $PYTHON_PI (roda via ssh,
 # dentro dos Pis). Ver bloco de variáveis abaixo.
+#
+# NOVO NESTA VERSÃO (lições do run full_both, run-id 12236978770257893145):
+#   (1) run(): PYTHONUNBUFFERED=1 — sem isso, o `| tee` fazia o stdout do
+#       CLI do flwr ficar em buffer de bloco (~8 KB) e NENHUMA linha do
+#       ServerApp ([ROUND x/Y], aggregate_*) aparecia no terminal nem no
+#       server_run_<TAG>.log até o fim do run. Novo subcomando `logs`.
+#   (2) ROUND_TIMEOUT_S agora é OBRIGATÓRIO em run/all e é repassado como
+#       round-timeout-s. Antes nunca era repassado: o servidor ficava no
+#       default de 3600 s por fase, e com LOCAL_EPOCHS=3 os Pis lentos
+#       estouravam o prazo em TODAS as rodadas (FedAvg só com 2-3 de 5).
+#   (3) Aborta se receber variáveis em minúsculas (ex.: patience=5), que o
+#       bash trata como OUTRA variável e o script ignorava em silêncio.
 # =============================================================================
 set -euo pipefail
 
@@ -89,16 +101,23 @@ MAX_WINDOWS="${MAX_WINDOWS:-0}"   # 0 = shard inteiro (só depuração usa >0)
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-1}"
 PATIENCE="${PATIENCE:-0}"        # 0 = early stopping desligado (default da lib)
 MIN_DELTA="${MIN_DELTA:-0.0}"
+# NOVO: prazo (s) de CADA fase (treino e avaliação) de CADA rodada. SEM
+# default de propósito: deve vir do tempo MEDIDO do Pi mais lento para a
+# combinação LOCAL_EPOCHS × MAX_SHARDS em uso (ex.: 1,5–2× esse tempo).
+# Resposta que chega depois do prazo é DESCARTADA em silêncio pelo Flower
+# e o FedAvg agrega só quem respondeu — foi o que invalidou o full_both.
+ROUND_TIMEOUT_S="${ROUND_TIMEOUT_S:-}"
 
 RUN_CONFIG="num-server-rounds=$ROUNDS local-epochs=$LOCAL_EPOCHS \
 max-shards=$MAX_SHARDS max-windows=$MAX_WINDOWS tag=\"$TAG\" \
 patience=$PATIENCE min-delta=$MIN_DELTA"
+[ -n "$ROUND_TIMEOUT_S" ] && RUN_CONFIG="$RUN_CONFIG round-timeout-s=$ROUND_TIMEOUT_S"
 [ -n "$V0_PATH" ] && RUN_CONFIG="$RUN_CONFIG v0-path=\"$V0_PATH\""
 # -----------------------------------------------------------------------------
 
 usage() {
   cat <<EOF
-Uso: $0 {preflight|superlink|supernodes|stop|manual|status|watch|run|collect|report|all}
+Uso: $0 {preflight|superlink|supernodes|stop|manual|status|watch|progress|run|logs|collect|report|all}
 
   preflight   (servidor) confere mount, shards train/test JÁ FILTRADOS por
               pi, env vars, import do task.py e o v0 com strict=True
@@ -129,18 +148,51 @@ Uso: $0 {preflight|superlink|supernodes|stop|manual|status|watch|run|collect|rep
               progress_<TAG>*.json — a mesma observabilidade do
               train_local_pi.py (RunMonitor/fed_monitor), já escrita por
               task.py em cada rodada. Ex.: $0 progress pi1
-  run         (servidor) dispara o run federado
+  run         (servidor) dispara o run federado (exige ROUND_TIMEOUT_S)
+  logs <id>   (servidor) reanexa o stream de logs de um run JÁ em
+              execução (só leitura; Ctrl+C desconecta, não para o run).
+              Ex.: $0 logs 12236978770257893145
   collect     (servidor) traz por rsync os artefatos do fed_monitor
   report      (servidor) consolida e extrapola ETA (smoke_report.py)
   all         preflight -> supernodes -> run -> collect -> report
               (SuperLink já ativo em outro terminal)
 
-Variáveis úteis: SERVER_IP DATA_ROOT V0_PATH TAG ROUNDS MAX_SHARDS
-                 LOCAL_EPOCHS APP_DIR_PI WLSTMIX_DIR_PI
+Variáveis úteis (SEMPRE em MAIÚSCULAS): SERVER_IP DATA_ROOT V0_PATH TAG
+                 ROUNDS MAX_SHARDS MAX_WINDOWS LOCAL_EPOCHS PATIENCE
+                 MIN_DELTA ROUND_TIMEOUT_S APP_DIR_PI WLSTMIX_DIR_PI
                  PYTHON_SERVER (interpretador local, servidor)
                  PYTHON_PI     (interpretador via ssh, dentro dos Pis)
 EOF
   exit 1
+}
+
+# NOVO: bash diferencia maiúsculas de minúsculas — `patience=5 ./script run`
+# cria uma variável `patience` que o script nunca lê, e o run seguia com
+# PATIENCE=0 sem avisar (aconteceu no full_both). ${!v+x} = "a variável
+# cujo nome está em v existe?" (expansão indireta; segura sob set -u).
+check_vars() {
+  local v falhou=0
+  for v in tag rounds max_shards max_windows local_epochs patience \
+           min_delta round_timeout_s v0_path data_root; do
+    if [ -n "${!v+x}" ]; then
+      echo "[ERRO] variável '${v}' em minúsculas foi passada e seria IGNORADA."
+      echo "       Use ${v^^}=${!v} no lugar."
+      falhou=1
+    fi
+  done
+  [ "$falhou" -eq 0 ] || exit 1
+}
+
+# NOVO: sem prazo medido, não dispara run.
+check_timeout() {
+  if [ -z "$ROUND_TIMEOUT_S" ]; then
+    echo "[ERRO] ROUND_TIMEOUT_S não definido."
+    echo "       É o prazo (s) de CADA fase de CADA rodada; resposta atrasada é"
+    echo "       descartada em silêncio. Defina a partir do tempo MEDIDO do Pi"
+    echo "       mais lento (treino local com LOCAL_EPOCHS=${LOCAL_EPOCHS},"
+    echo "       MAX_SHARDS=${MAX_SHARDS}), com folga, ex.: ROUND_TIMEOUT_S=10800"
+    exit 1
+  fi
 }
 
 # Conta os shards que o task.py REALMENTE verá para um dado pi — usa a
@@ -571,22 +623,49 @@ progress() {
 }
 
 run() {
+  check_timeout
   cd "$APP_DIR"
   echo "[smoke] flwr run . ${FEDERATION} --run-config '${RUN_CONFIG}'"
   echo "[smoke] saída também gravada em server_run_${TAG}.log — dá pra"
   echo "        acompanhar de outro terminal com: tail -f ${APP_DIR}/server_run_${TAG}.log"
+  echo "[smoke] se este terminal cair, o run CONTINUA; reanexe com:"
+  echo "        $0 logs <run-id>"
   T0=$(date +%s)
-  # tee: mantém a saída ao vivo NESTE terminal (como antes) e também grava
-  # em arquivo, para acompanhar (ou conferir depois) de outro terminal sem
-  # precisar deixar este aberto. set -o pipefail (já ativo no topo do
-  # script) garante que um `flwr run` com erro ainda propague seu próprio
-  # exit code através do pipe.
-  flwr run . "$FEDERATION" --run-config "$RUN_CONFIG" --stream \
+  # tee: mantém a saída ao vivo NESTE terminal e também grava em arquivo.
+  #
+  # CORREÇÃO (run full_both): PYTHONUNBUFFERED=1 é OBRIGATÓRIO aqui. O
+  # CLI do flwr imprime as linhas do ServerApp com print() em stdout
+  # (flwr/cli/log.py, stream_logs), e o Python usa buffer de BLOCO
+  # (~8 KB) quando stdout é um pipe em vez de terminal. Com o `| tee`,
+  # ~75 linhas em 2 dias (~5 KB) nunca encheram o buffer: o terminal só
+  # mostrou a linha "Starting logstream" (que vai por stderr/logger, sem
+  # esse buffer) e o server_run_<TAG>.log ficou vazio. `stdbuf -oL` NÃO
+  # resolveria: o Python gerencia o próprio buffer, não o da libc.
+  #
+  # set -o pipefail (já ativo no topo) garante que um `flwr run` com erro
+  # ainda propague seu próprio exit code através do pipe.
+  PYTHONUNBUFFERED=1 flwr run . "$FEDERATION" --run-config "$RUN_CONFIG" --stream \
     2>&1 | tee "server_run_${TAG}.log"
   T1=$(date +%s)
   echo "[smoke] run concluído em $((T1-T0)) s (ponta a ponta, servidor)."
   echo "[smoke] overhead de agregação ≈ (esse valor − max wall_time_s dos "
   echo "        Pis) / ${ROUNDS} — use como --agg-overhead-s no report."
+}
+
+# NOVO: reanexa o stream de logs de um run em andamento. Só leitura —
+# Ctrl+C desconecta o stream, NÃO para o run (para parar seria
+# `flwr stop`, que este script nunca chama). Assinatura conferida em
+# flwr/cli/log.py: `flwr log RUN_ID [SUPERLINK] --stream/--show` — após
+# a migração da config, o argumento "." (app) não é mais aceito aqui.
+logs() {
+  local run_id="${1:-}"
+  if [ -z "$run_id" ]; then
+    echo "Uso: $0 logs <run-id>   (veja o id com: flwr list ${FEDERATION})"
+    exit 1
+  fi
+  cd "$APP_DIR"
+  PYTHONUNBUFFERED=1 flwr log "$run_id" "$FEDERATION" --stream \
+    2>&1 | tee -a "server_log_${run_id}.log"
 }
 
 collect() {
@@ -618,7 +697,7 @@ report() {
 }
 
 case "${1:-}" in
-  preflight)  preflight ;;
+  preflight)  check_vars; preflight ;;
   superlink)  superlink ;;
   supernodes) supernodes ;;
   stop)       stop_supernodes ;;
@@ -626,9 +705,10 @@ case "${1:-}" in
   status)     status ;;
   watch)      shift; watch_pi "${1:-}" ;;
   progress)   shift; progress "${1:-}" ;;
-  run)        run ;;
+  run)        check_vars; run ;;
+  logs)       shift; logs "${1:-}" ;;
   collect)    collect ;;
   report)     shift; report "$@" ;;
-  all)        preflight; supernodes; sleep 12; run; collect; report ;;
+  all)        check_vars; check_timeout; preflight; supernodes; sleep 12; run; collect; report ;;
   *)          usage ;;
 esac
