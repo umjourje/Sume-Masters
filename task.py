@@ -59,6 +59,23 @@ shard em loss_<tag>.jsonl e confusion_matrix_<tag>.json por cliente.
    train_bce_loss / train_bce_loss_epochs — útil para acompanhar a
    classificação isoladamente do erro de forecasting no TensorBoard.
 
+4) AUC-ROC e PR-AUC no evaluate() (aditivo). Calculados sobre o score
+   CONTÍNUO por ponto (p = psum/pcnt, a mesma média de probabilidades
+   usada para o limiar), não sobre a matriz de confusão — esta é um único
+   ponto da curva ROC e não permite reconstruir a área.
+     * roc_auc / pr_auc entram no dict de retorno (-> TensorBoard do
+       servidor, por cliente e agregado) e no confusion_matrix_<tag>.json.
+     * ATENÇÃO: o valor "agregado" que o FedAvg produz é MÉDIA PONDERADA
+       de AUCs por cliente, que NÃO é o AUC do conjunto unido (AUC não é
+       aditivo: depende da ordenação dos scores ENTRE clientes). Serve só
+       para acompanhar tendência por rodada. O AUC a reportar vem do
+       eval_auc.py (pooled), que reavalia o checkpoint post-hoc.
+     * Se a partição não tiver as duas classes, AUC é indefinido: devolve
+       NaN (a chave é sempre emitida — o FedAvg espera o mesmo conjunto de
+       chaves em todos os clientes).
+     * scores_out (opcional, default None = comportamento anterior):
+       grava y (uint8) e p (float32) por ponto num .npz, para o pooled.
+
 Requisito: PIPELINE_DIR no ambiente apontando para a pasta do pipeline
 (onde vivem config.py, step6_train.py, country_map.py, fed_monitor.py).
 """
@@ -298,14 +315,19 @@ def evaluate(model: HybridWLSTMix, data_root: Path, device,
              tag: str = "run", pi: int = 0,
              max_shards: int = 0, max_windows: int = 0,
              metrics_dir: Path | None = None,
-             round_no: int | None = None) -> dict:
+             round_no: int | None = None,
+             scores_out: Path | None = None) -> dict:
     """Modelo GLOBAL na partição de TESTE local: rótulos em runtime +
     test_loss conjunto (métrica de seleção do servidor) + forecasting
-    (paper) + classificação.
+    (paper) + classificação (limiar) + ranking (AUC-ROC/PR-AUC).
 
     Grava <metrics_dir>/confusion_matrix_<tag>.json com o esquema já
-    usado no projeto + wall_time_s e recursos do dispositivo."""
-    from sklearn.metrics import f1_score, precision_score, recall_score
+    usado no projeto + wall_time_s e recursos do dispositivo. Se
+    scores_out for dado, grava também y/p por ponto (.npz) — usado pelo
+    eval_auc.py para o AUC pooled entre partições."""
+    from sklearn.metrics import (average_precision_score, f1_score,
+                                 precision_score, recall_score,
+                                 roc_auc_score)
     B, F = CFG.backcast_length, CFG.forecast_length
     pts = _amostrar_shards(_load_local("test", data_root, pi), max_shards)
     if not pts:
@@ -390,6 +412,25 @@ def evaluate(model: HybridWLSTMix, data_root: Path, device,
     f1v = float(f1_score(y, pred, zero_division=0))
     prec = float(precision_score(y, pred, zero_division=0))
     rec = float(recall_score(y, pred, zero_division=0))
+    # AUC sobre o score CONTÍNUO p (independe do limiar). Indefinido com
+    # uma classe só -> NaN, mas a chave sempre existe (ver docstring).
+    if np.unique(y).size < 2:
+        roc_auc = pr_auc = float("nan")
+    else:
+        roc_auc = float(roc_auc_score(y, p))
+        pr_auc = float(average_precision_score(y, p))
+
+    if scores_out is not None:
+        # Escrita atômica; file object evita o sufixo .npz automático do
+        # numpy no nome temporário.
+        so = Path(scores_out)
+        so.parent.mkdir(parents=True, exist_ok=True)
+        so_tmp = so.with_name(so.name + ".tmp")
+        with open(so_tmp, "wb") as fh:
+            np.savez_compressed(fh, y=np.asarray(y).astype(np.uint8),
+                                p=np.asarray(p).astype(np.float32))
+        os.replace(so_tmp, so)
+
     cm = {
         "tag": tag,
         "pi": int(pi),
@@ -399,6 +440,11 @@ def evaluate(model: HybridWLSTMix, data_root: Path, device,
         "recall": round(rec, 6),
         "f1": round(f1v, 6),
         "accuracy": round(float((tp + tn) / max(y.size, 1)), 6),
+        "threshold": float(threshold),
+        # NaN vira null no JSON (json.dumps aceita NaN, mas null é o
+        # que outros leitores entendem) — daí o None.
+        "roc_auc": None if np.isnan(roc_auc) else round(roc_auc, 6),
+        "pr_auc": None if np.isnan(pr_auc) else round(pr_auc, 6),
         "taxa_anomalia_teste": round(float(y.mean()), 6),
         # amostragem usada (para não confundir smoke com run completo)
         "n_shards": len(pts),
@@ -424,6 +470,8 @@ def evaluate(model: HybridWLSTMix, data_root: Path, device,
         "f1": f1v,                                # classif.
         "precision": prec,
         "recall": rec,
+        "roc_auc": roc_auc,     # por cliente; agregado = só tendência
+        "pr_auc": pr_auc,       # (ver docstring do módulo, item 4)
         "anomaly_rate": float(y.mean()),
         "metrics_fallback": int(_METRICS_FALLBACK),
         "num-examples": int(n_windows),

@@ -38,6 +38,15 @@
 #       estouravam o prazo em TODAS as rodadas (FedAvg só com 2-3 de 5).
 #   (3) Aborta se receber variáveis em minúsculas (ex.: patience=5), que o
 #       bash trata como OUTRA variável e o script ignorava em silêncio.
+#
+# NOVO (collect/AUC):
+#   (4) collect traz SÓ os artefatos da TAG corrente (*_<TAG>.* e
+#       *_<TAG>_eval.*). Antes o rsync copiava METRICS_DIR_PI inteiro —
+#       smoke, calib, full_both… — para metrics_<TAG>/, e o report
+#       misturava runs diferentes.
+#   (5) Novo subcomando `auc`: AUC-ROC/PR-AUC post-hoc de um checkpoint
+#       (eval_auc.py), por partição e pooled. Exige CKPT e MAX_SHARDS
+#       explícitos.
 # =============================================================================
 set -euo pipefail
 
@@ -96,6 +105,10 @@ V0_PATH="${V0_PATH:-$V0REAL}"
 
 TAG="${TAG:-smoke}"
 ROUNDS="${ROUNDS:-1}"
+# NOVO: lembra se MAX_SHARDS veio do usuário ANTES de aplicar o default —
+# o `auc` recusa rodar no default de smoke (2), que avaliaria o modelo em
+# outra amostra de shards e tornaria o AUC incomparável.
+MAX_SHARDS_USER="${MAX_SHARDS:-}"
 MAX_SHARDS="${MAX_SHARDS:-2}"     # smoke=2; run completo=15 (= centralizado)
 MAX_WINDOWS="${MAX_WINDOWS:-0}"   # 0 = shard inteiro (só depuração usa >0)
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-1}"
@@ -107,6 +120,8 @@ MIN_DELTA="${MIN_DELTA:-0.0}"
 # Resposta que chega depois do prazo é DESCARTADA em silêncio pelo Flower
 # e o FedAvg agrega só quem respondeu — foi o que invalidou o full_both.
 ROUND_TIMEOUT_S="${ROUND_TIMEOUT_S:-}"
+# NOVO: checkpoint a avaliar no subcomando `auc` (caminho no SERVIDOR).
+CKPT="${CKPT:-}"
 
 RUN_CONFIG="num-server-rounds=$ROUNDS local-epochs=$LOCAL_EPOCHS \
 max-shards=$MAX_SHARDS max-windows=$MAX_WINDOWS tag=\"$TAG\" \
@@ -117,7 +132,7 @@ patience=$PATIENCE min-delta=$MIN_DELTA"
 
 usage() {
   cat <<EOF
-Uso: $0 {preflight|superlink|supernodes|stop|manual|status|watch|progress|run|logs|collect|report|all}
+Uso: $0 {preflight|superlink|supernodes|stop|manual|status|watch|progress|run|logs|collect|report|auc|all}
 
   preflight   (servidor) confere mount, shards train/test JÁ FILTRADOS por
               pi, env vars, import do task.py e o v0 com strict=True
@@ -153,13 +168,21 @@ Uso: $0 {preflight|superlink|supernodes|stop|manual|status|watch|progress|run|lo
               execução (só leitura; Ctrl+C desconecta, não para o run).
               Ex.: $0 logs 12236978770257893145
   collect     (servidor) traz por rsync os artefatos do fed_monitor
+              SÓ da TAG corrente (*_TAG.* e *_TAG_eval.*)
   report      (servidor) consolida e extrapola ETA (smoke_report.py)
+  auc [args]  (servidor) AUC-ROC/PR-AUC post-hoc de CKPT, por partição e
+              pooled (eval_auc.py). Exige CKPT e MAX_SHARDS. Argumentos
+              extras vão direto ao eval_auc.py. Ex.:
+              TAG=full_real MAX_SHARDS=15 CKPT=best_model_global_full_real.pth \\
+                $0 auc
+              TAG=central_pi3 MAX_SHARDS=15 CKPT=/…/best_model.pth \\
+                $0 auc --pis 3
   all         preflight -> supernodes -> run -> collect -> report
               (SuperLink já ativo em outro terminal)
 
 Variáveis úteis (SEMPRE em MAIÚSCULAS): SERVER_IP DATA_ROOT V0_PATH TAG
                  ROUNDS MAX_SHARDS MAX_WINDOWS LOCAL_EPOCHS PATIENCE
-                 MIN_DELTA ROUND_TIMEOUT_S APP_DIR_PI WLSTMIX_DIR_PI
+                 MIN_DELTA ROUND_TIMEOUT_S CKPT APP_DIR_PI WLSTMIX_DIR_PI
                  PYTHON_SERVER (interpretador local, servidor)
                  PYTHON_PI     (interpretador via ssh, dentro dos Pis)
 EOF
@@ -173,7 +196,7 @@ EOF
 check_vars() {
   local v falhou=0
   for v in tag rounds max_shards max_windows local_epochs patience \
-           min_delta round_timeout_s v0_path data_root; do
+           min_delta round_timeout_s v0_path data_root ckpt; do
     if [ -n "${!v+x}" ]; then
       echo "[ERRO] variável '${v}' em minúsculas foi passada e seria IGNORADA."
       echo "       Use ${v^^}=${!v} no lugar."
@@ -668,15 +691,41 @@ logs() {
     2>&1 | tee -a "server_log_${run_id}.log"
 }
 
+# collect(): traz SÓ os artefatos da TAG corrente.
+#
+# CORREÇÃO: antes era `rsync -av pi:METRICS_DIR_PI/ ...` sem filtro — todo
+# run já feito naquele Pi (smoke, calib, full_both…) vinha junto para
+# metrics_<TAG>/, e o report (glob */summary_*) misturava runs.
+#
+# Nomes gravados pelo RunMonitor/task.py (client_app.py passa a MESMA tag
+# para train e evaluate; evaluate usa f"{tag}_eval" no RunMonitor):
+#   loss_<TAG>.jsonl  progress_<TAG>.json  summary_<TAG>.json
+#   confusion_matrix_<TAG>.json  e os equivalentes *_<TAG>_eval.*
+#
+# Regras do rsync: vale a PRIMEIRA que casar. Ordem importa:
+#   1) *.tmp fora (escrita atômica em andamento — confusion_matrix_X.json.tmp
+#      casaria com a regra 2);
+#   2) *_TAG.* e *_TAG_eval.* dentro — padrão EXATO: TAG=full_real NÃO
+#      puxa full_real2 (um glob *TAG* puxaria);
+#   3) todo o resto fora.
+# rsync já é incremental (só transfere o que mudou), então rodar collect
+# várias vezes durante o run é barato.
 collect() {
   cd "$APP_DIR"
   mkdir -p "metrics_${TAG}"
+  echo "[collect] TAG=${TAG} — só *_${TAG}.* e *_${TAG}_eval.*"
   for pi in "${PIS[@]}"; do
     mkdir -p "metrics_${TAG}/${pi}"
-    rsync -av "${pi}:${METRICS_DIR_PI}/" "metrics_${TAG}/${pi}/" || \
+    rsync -av \
+      --exclude='*.tmp' \
+      --include="*_${TAG}.*" \
+      --include="*_${TAG}_eval.*" \
+      --exclude='*' \
+      -e "ssh -o ConnectTimeout=${SSH_TIMEOUT_S}" \
+      "${pi}:${METRICS_DIR_PI}/" "metrics_${TAG}/${pi}/" || \
       echo "[aviso] rsync falhou para ${pi}"
   done
-  echo "[smoke] artefatos em metrics_${TAG}/<pi>/"
+  echo "[collect] artefatos em metrics_${TAG}/<pi>/"
 }
 
 report() {
@@ -696,6 +745,36 @@ report() {
   fi
 }
 
+# auc(): AUC-ROC/PR-AUC post-hoc (eval_auc.py) — roda NO SERVIDOR, com o
+# mesmo PYTHON_SERVER e cwd do preflight (onde `import task` já funciona),
+# sobre o DATA_ROOT compartilhado. Serve tanto para o checkpoint federado
+# quanto para o centralizado — para comparar, use os MESMOS --pis e
+# MAX_SHARDS nos dois.
+auc() {
+  local falhou=0
+  if [ -z "$CKPT" ]; then
+    echo "[ERRO] CKPT não definido (caminho do state_dict no servidor)."
+    falhou=1
+  elif [ ! -f "$CKPT" ] && [ ! -f "${APP_DIR}/${CKPT}" ]; then
+    echo "[ERRO] CKPT='${CKPT}' não existe (nem relativo a APP_DIR)."
+    falhou=1
+  fi
+  if [ -z "$MAX_SHARDS_USER" ]; then
+    echo "[ERRO] MAX_SHARDS não foi passado. Use o MESMO do run avaliado"
+    echo "       (15 nos runs completos); o default (2) é só do smoke."
+    falhou=1
+  fi
+  [ "$falhou" -eq 0 ] || exit 1
+  # Caminho relativo ao diretório ATUAL vira absoluto antes do cd abaixo.
+  [ -f "$CKPT" ] && CKPT="$(realpath "$CKPT")"
+  cd "$APP_DIR"
+  "$PYTHON_SERVER" eval_auc.py \
+    --ckpt "$CKPT" --name "$TAG" \
+    --data-root "$DATA_ROOT" \
+    --max-shards "$MAX_SHARDS" --max-windows "$MAX_WINDOWS" \
+    --out-dir "metrics_${TAG}/auc" "$@"
+}
+
 case "${1:-}" in
   preflight)  check_vars; preflight ;;
   superlink)  superlink ;;
@@ -707,8 +786,9 @@ case "${1:-}" in
   progress)   shift; progress "${1:-}" ;;
   run)        check_vars; run ;;
   logs)       shift; logs "${1:-}" ;;
-  collect)    collect ;;
-  report)     shift; report "$@" ;;
+  collect)    check_vars; collect ;;
+  report)     check_vars; shift; report "$@" ;;
+  auc)        check_vars; shift; auc "$@" ;;
   all)        check_vars; check_timeout; preflight; supernodes; sleep 12; run; collect; report ;;
   *)          usage ;;
 esac
