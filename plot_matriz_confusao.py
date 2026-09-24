@@ -133,7 +133,26 @@ data_input = {
     "load1_avg": 3.7599806248486316,
     "ram_used_gb_avg": 1.3693734850598236,
     "ram_used_gb_max": 2.259998321533203,},
-  "cen4":{},
+  "cen4":{
+    "titulo": "Matriz de Confusão - Cenário IV\nFederado / Real + Sintético",
+    "tag": "full_both",
+    "pi": 1,
+    "TP": 2720035,
+    "TN": 32329314,
+    "FP": 21587245,
+    "FN": 384142,
+    "total_pontos": 57020736,
+    "precision": 0.111902,
+    "recall": 0.87625,
+    "f1": 0.19846,
+    "accuracy": 0.614677,
+    "taxa_anomalia_teste": 0.054439,
+    "wall_time_s": 645.6229023933411,
+    "wall_time_s": 645.6229023933411,
+    "ram_used_gb_avg": 2.8651944087101864,
+    "ram_used_gb_max": 4.057529449462891,
+    "ram_total_gb": 15.59878921508789,
+  },
 }
 
 # Gerar o gráfico
