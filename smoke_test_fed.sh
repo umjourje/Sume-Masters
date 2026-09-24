@@ -645,8 +645,33 @@ progress() {
   '"
 }
 
+# NOVO: toda chave do --run-config precisa estar declarada em
+# [tool.flwr.app.config] do pyproject.toml — o Flower funde com
+# fuse_dicts(check_keys=True) e rejeita chave desconhecida, mas o erro
+# que chega ao terminal é só "[code: 15] Invalid run configuration", sem
+# dizer QUAL chave (foi o que aconteceu no primeiro full_real: patience,
+# min-delta e round-timeout-s não estavam no pyproject). Aqui checamos
+# antes e nomeamos a chave faltante. tomllib: stdlib do Python >= 3.11.
+check_run_config_keys() {
+  RUN_CONFIG="$RUN_CONFIG" "$PYTHON_SERVER" - "${APP_DIR}/pyproject.toml" <<'PY'
+import os, re, sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    decl = tomllib.load(fh)["tool"]["flwr"]["app"].get("config", {})
+passadas = re.findall(r'(?:^|\s)([A-Za-z0-9_-]+)=', os.environ["RUN_CONFIG"])
+faltam = [k for k in passadas if k not in decl]
+if faltam:
+    print("[ERRO] chave(s) do --run-config ausente(s) em "
+          "[tool.flwr.app.config] do pyproject.toml:", ", ".join(faltam))
+    print("       O Flower rejeitaria com '[code: 15] Invalid run "
+          "configuration'. Declare-as lá com o default do código.")
+    sys.exit(1)
+print(f"[smoke] run-config OK: {len(passadas)} chaves declaradas no pyproject.")
+PY
+}
+
 run() {
   check_timeout
+  check_run_config_keys
   cd "$APP_DIR"
   echo "[smoke] flwr run . ${FEDERATION} --run-config '${RUN_CONFIG}'"
   echo "[smoke] saída também gravada em server_run_${TAG}.log — dá pra"

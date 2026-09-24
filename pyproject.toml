@@ -17,6 +17,12 @@ publisher = "tupa"
 serverapp = "server_app:app"
 clientapp = "client_app:app"
 
+# ATENÇÃO: TODA chave passada em `flwr run --run-config` PRECISA existir
+# aqui. O Flower funde o --run-config sobre esta tabela com
+# fuse_dicts(check_keys=True), que rejeita chave desconhecida — o erro
+# aparece como "[code: 15] Invalid run configuration" (visto no run
+# full_real). Ao adicionar uma chave nova no server_app/client_app,
+# declare-a aqui com o MESMO default usado no .get() do código.
 [tool.flwr.app.config]
 num-server-rounds = 1
 local-epochs = 1
@@ -30,6 +36,16 @@ tag = "default"
 #      de N shards por cliente (uso: smoke test, ex. max-shards=2).
 max-shards = 15
 max-windows = 0
+# ---- NOVO (early stopping federado + prazo por rodada; server_app.py) ----
+# patience: rodadas seguidas sem melhora de test_loss antes de parar.
+#      0 = desligado (roda num-server-rounds inteiras).
+patience = 0
+# min-delta: melhora mínima de test_loss para contar como "melhorou".
+min-delta = 0.0
+# round-timeout-s: prazo (s) de CADA fase (treino e avaliação) de CADA
+#      rodada. Resposta atrasada é DESCARTADA em silêncio. Default = o da
+#      biblioteca (3600 s); o smoke_test_fed.sh exige valor explícito.
+round-timeout-s = 3600.0
 # metrics-dir NÃO fica aqui: é por dispositivo, declarado no node-config
 # de cada SuperNode:
 #   flower-supernode ... --node-config \
