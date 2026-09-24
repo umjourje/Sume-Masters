@@ -92,7 +92,7 @@ SYNTH="/mnt/juliana-truenas/Synth-EnergyBench-Anomaly"
 V0REAL="$SYNTH/04_models/v0_real/best_model.pth"
 V0BOTH="$SYNTH/04_models/v0_final/best_model.pth"
 # Both Real+Sintético
-V0_PATH="${V0_PATH:-$V0BOTH}"
+V0_PATH="${V0_PATH:-$V0REAL}"
 
 TAG="${TAG:-smoke}"
 ROUNDS="${ROUNDS:-1}"
