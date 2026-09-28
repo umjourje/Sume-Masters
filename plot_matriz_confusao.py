@@ -38,14 +38,16 @@ def plot_confusion_matrix_from_dict(data,
 
     # 3. Extração das estatísticas de resumo
     accuracy = data.get('accuracy', np.trace(cf) / float(np.sum(cf)))
-    precision = data.get('precision', cf[1, 1] / sum(cf[:, 1]))
     recall = data.get('recall', cf[1, 1] / sum(cf[1, :]))
-    f1_score = data.get('f1', 2 * (precision * recall) / (precision + recall))
+    aucroc = data.get('aucroc')
+    # precision = data.get('precision', cf[1, 1] / sum(cf[:, 1]))
+    # f1_score = data.get('f1', 2 * (precision * recall) / (precision + recall))
 
     stats_text = (f"\n\nAcurácia={accuracy:0.3f}\n"
-                  f"Precisão={precision:0.3f}\n"
                   f"Recall={recall:0.3f}\n"
-                  f"F1 Score={f1_score:0.3f}")
+                  f"AUC-ROC Score={aucroc:0.3f}\n")
+    #              f"Precisão={precision:0.3f}\n"
+    #              f"F1 Score={f1_score:0.3f}")
 
     # 4. Plotagem com Seaborn
     fig, ax = plt.subplots(figsize=figsize)
