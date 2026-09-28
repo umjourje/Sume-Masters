@@ -15,6 +15,12 @@ scores; depois calcula:
   * macro   — média simples dos AUCs por partição (visão "cada cliente
               pesa igual", útil para discutir heterogeneidade Non-IID).
 
+Acurácia (no --threshold) também sai por partição, pooled e macro, junto
+com a linha de base "classe majoritária" (max(prev, 1-prev)): com ~5-10%
+de anomalias, um modelo que diz sempre "normal" já tem ~90-95% de
+acurácia — a acurácia só é informativa comparada a essa linha de base
+(e ao lado da acurácia balanceada, que vale 0,5 para esse modelo trivial).
+
 Comparação justa federado × centralizado: rode este script nos DOIS
 checkpoints com os MESMOS --pis, --max-shards e --max-windows. Como
 task.evaluate() amostra shards de forma determinística (linspace) e rotula
@@ -46,7 +52,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.metrics import (average_precision_score, f1_score,
+from sklearn.metrics import (accuracy_score, average_precision_score,
+                             balanced_accuracy_score, f1_score,
                              precision_score, recall_score, roc_auc_score)
 
 import task
@@ -65,6 +72,22 @@ def _aucs(y: np.ndarray, p: np.ndarray) -> tuple[float | None, float | None]:
     if np.unique(y).size < 2:
         return None, None
     return float(roc_auc_score(y, p)), float(average_precision_score(y, p))
+
+
+def _cls(y: np.ndarray, p: np.ndarray, thr: float) -> dict:
+    """Métricas limiarizadas + linha de base da classe majoritária."""
+    pred = (p >= thr).astype(np.uint8)
+    prev = float(y.mean()) if y.size else 0.0
+    return {
+        "accuracy": float(accuracy_score(y, pred)),
+        "accuracy_baseline_majoritaria": max(prev, 1.0 - prev),
+        # indefinida com uma classe só (sklearn avisa e devolve a recall)
+        "balanced_accuracy": (float(balanced_accuracy_score(y, pred))
+                              if np.unique(y).size == 2 else None),
+        "f1": float(f1_score(y, pred, zero_division=0)),
+        "precision": float(precision_score(y, pred, zero_division=0)),
+        "recall": float(recall_score(y, pred, zero_division=0)),
+    }
 
 
 def _write_json(path: Path, obj: dict) -> None:
@@ -139,19 +162,22 @@ def main() -> None:
         d = np.load(npz)
         y, p = d["y"].astype(np.uint8), d["p"].astype(np.float32)
         roc, pr = _aucs(y, p)
+        c = _cls(y, p, args.threshold)
         per_pi[str(pi)] = {"roc_auc": roc, "pr_auc": pr,
                            "n_pontos": int(y.size),
-                           "taxa_anomalia": float(y.mean())}
-        print(f"[auc] pi={pi}: roc_auc={roc} pr_auc={pr} n={y.size}")
+                           "taxa_anomalia": float(y.mean()), **c}
+        print(f"[auc] pi={pi}: roc_auc={roc} pr_auc={pr} "
+              f"acc={c['accuracy']:.4f} (base {c['accuracy_baseline_majoritaria']:.4f}) "
+              f"n={y.size}")
         ys.append(y)
         ps.append(p)
 
     y = np.concatenate(ys)
     p = np.concatenate(ps)
     roc, pr = _aucs(y, p)
-    pred = (p >= args.threshold).astype(np.uint8)
     rocs = [v["roc_auc"] for v in per_pi.values() if v["roc_auc"] is not None]
     prs = [v["pr_auc"] for v in per_pi.values() if v["pr_auc"] is not None]
+    accs = [v["accuracy"] for v in per_pi.values()]
 
     result = {
         "name": args.name,
@@ -167,14 +193,13 @@ def main() -> None:
             "pr_auc_baseline": float(y.mean()),
             "n_pontos": int(y.size),
             "threshold": args.threshold,
-            "f1": float(f1_score(y, pred, zero_division=0)),
-            "precision": float(precision_score(y, pred, zero_division=0)),
-            "recall": float(recall_score(y, pred, zero_division=0)),
+            **_cls(y, p, args.threshold),
         },
         "macro": {
             "roc_auc": float(np.mean(rocs)) if rocs else None,
             "pr_auc": float(np.mean(prs)) if prs else None,
             "n_particoes_validas": len(rocs),
+            "accuracy": float(np.mean(accs)) if accs else None,
         },
         "per_pi": per_pi,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -182,7 +207,10 @@ def main() -> None:
     res_path = out / f"auc_{args.name}.json"
     _write_json(res_path, result)
     print(f"[auc] POOLED roc_auc={roc} pr_auc={pr} "
-          f"(baseline PR={y.mean():.4f}) -> {res_path}")
+          f"(baseline PR={y.mean():.4f}) "
+          f"acc={result['pooled']['accuracy']:.4f} "
+          f"(base {result['pooled']['accuracy_baseline_majoritaria']:.4f}) "
+          f"-> {res_path}")
 
 
 if __name__ == "__main__":
