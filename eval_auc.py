@@ -27,6 +27,11 @@ task.evaluate() amostra shards de forma determinística (linspace) e rotula
 em runtime com funções determinísticas, os dois modelos são avaliados
 exatamente nos mesmos pontos.
 
+NOVO: a avaliação vive em avaliar(), importável. O train_local_pi.py a
+chama ao fim do treino centralizado — o MESMO código que avalia o
+checkpoint federado, sem segunda implementação que possa divergir. A
+saída (pasta, nomes, esquema) é idêntica à da linha de comando.
+
 Uso (no servidor, a partir do diretório do app — o mesmo cwd do preflight):
 
     python eval_auc.py --ckpt best_model_global_full_real.pth \
@@ -34,7 +39,7 @@ Uso (no servidor, a partir do diretório do app — o mesmo cwd do preflight):
         --max-shards 15
 
     # centralizado de um Pi específico, mesma avaliação:
-    python eval_auc.py --ckpt /caminho/central_pi3/best_model.pth \
+    python eval_auc.py --ckpt /caminho/central_pi3/best_local.pth \
         --name central_pi3 --data-root ... --max-shards 15 --pis 3
 
 --reuse: reaproveita scores_pi<N>.npz já calculados (ex.: o script caiu
@@ -96,48 +101,36 @@ def _write_json(path: Path, obj: dict) -> None:
     os.replace(tmp, path)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--ckpt", required=True, type=Path,
-                    help="state_dict (best_model_global.pth, best_model.pth…)")
-    ap.add_argument("--name", required=True,
-                    help="rótulo do experimento, ex.: fed_full_real, central_pi3")
-    ap.add_argument("--data-root", required=True, type=Path)
-    ap.add_argument("--pis", type=int, nargs="+", default=[1, 2, 3, 4, 5])
-    ap.add_argument("--max-shards", type=int, required=True,
-                    help="MESMO valor do run avaliado (15 nos runs completos)")
-    ap.add_argument("--max-windows", type=int, default=0)
-    ap.add_argument("--threshold", type=float, default=0.5,
-                    help="só para F1/precision/recall de referência")
-    ap.add_argument("--out-dir", type=Path, default=Path("auc_posthoc"))
-    ap.add_argument("--reuse", action="store_true")
-    args = ap.parse_args()
-
-    if not args.ckpt.exists():
-        raise SystemExit(f"[ERRO] checkpoint não existe: {args.ckpt}")
-    out = args.out_dir / args.name
+def avaliar(model, ckpt: Path, name: str, data_root: Path, device,
+            pis: list[int], max_shards: int, max_windows: int = 0,
+            threshold: float = 0.5, out_dir: Path = Path("auc_posthoc"),
+            reuse: bool = False) -> dict:
+    """Avalia `model` (já com os pesos de `ckpt` carregados) partição por
+    partição via task.evaluate e grava em <out_dir>/<name>/:
+      scores_pi<N>.npz, scores_pi<N>.meta.json,
+      confusion_matrix_<name>_pi<N>.json (do task.evaluate) e
+      auc_<name>.json (pooled/macro/per_pi). Devolve o dict do auc json.
+    `ckpt` só é lido para o sha256 (prova de qual checkpoint foi avaliado).
+    """
+    ckpt = Path(ckpt)
+    out = Path(out_dir) / name
     out.mkdir(parents=True, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = task.get_model(task.load_config(), device)
-    model.load_state_dict(torch.load(args.ckpt, map_location=device),
-                          strict=True)
     model.eval()
-    sha = _sha256(args.ckpt)
-    print(f"[auc] ckpt={args.ckpt} sha256={sha[:12]}… device={device}")
-    print(f"[auc] pis={args.pis} max_shards={args.max_shards} "
-          f"max_windows={args.max_windows} -> {out}")
+    sha = _sha256(ckpt)
+    print(f"[auc] ckpt={ckpt} sha256={sha[:12]}… device={device}")
+    print(f"[auc] pis={pis} max_shards={max_shards} "
+          f"max_windows={max_windows} -> {out}")
 
-    sampling = {"sha256": sha, "max_shards": args.max_shards,
-                "max_windows": args.max_windows,
-                "data_root": str(args.data_root)}
+    sampling = {"sha256": sha, "max_shards": int(max_shards),
+                "max_windows": int(max_windows),
+                "data_root": str(data_root)}
     per_pi: dict[str, dict] = {}
     ys, ps = [], []
-    for pi in args.pis:
+    for pi in pis:
         npz = out / f"scores_pi{pi}.npz"
         meta = out / f"scores_pi{pi}.meta.json"
         reuse_ok = False
-        if args.reuse and npz.exists() and meta.exists():
+        if reuse and npz.exists() and meta.exists():
             old = json.loads(meta.read_text())
             reuse_ok = all(old.get(k) == v for k, v in sampling.items())
             if not reuse_ok:
@@ -148,11 +141,11 @@ def main() -> None:
         else:
             t0 = time.time()
             print(f"[auc] pi={pi}: avaliando…", flush=True)
-            task.evaluate(model, args.data_root, device,
-                          threshold=args.threshold,
-                          tag=f"{args.name}_pi{pi}", pi=pi,
-                          max_shards=args.max_shards,
-                          max_windows=args.max_windows,
+            task.evaluate(model, data_root, device,
+                          threshold=threshold,
+                          tag=f"{name}_pi{pi}", pi=pi,
+                          max_shards=max_shards,
+                          max_windows=max_windows,
                           metrics_dir=out, round_no=None,
                           scores_out=npz)
             _write_json(meta, {**sampling, "pi": pi,
@@ -162,7 +155,7 @@ def main() -> None:
         d = np.load(npz)
         y, p = d["y"].astype(np.uint8), d["p"].astype(np.float32)
         roc, pr = _aucs(y, p)
-        c = _cls(y, p, args.threshold)
+        c = _cls(y, p, threshold)
         per_pi[str(pi)] = {"roc_auc": roc, "pr_auc": pr,
                            "n_pontos": int(y.size),
                            "taxa_anomalia": float(y.mean()), **c}
@@ -180,20 +173,20 @@ def main() -> None:
     accs = [v["accuracy"] for v in per_pi.values()]
 
     result = {
-        "name": args.name,
-        "ckpt": str(args.ckpt),
+        "name": name,
+        "ckpt": str(ckpt),
         "ckpt_sha256": sha,
-        "pis": args.pis,
-        "max_shards": args.max_shards,
-        "max_windows": args.max_windows,
+        "pis": list(pis),
+        "max_shards": int(max_shards),
+        "max_windows": int(max_windows),
         "pooled": {
             "roc_auc": roc,
             "pr_auc": pr,
             # linha de base do PR-AUC = prevalência (classificador aleatório)
             "pr_auc_baseline": float(y.mean()),
             "n_pontos": int(y.size),
-            "threshold": args.threshold,
-            **_cls(y, p, args.threshold),
+            "threshold": threshold,
+            **_cls(y, p, threshold),
         },
         "macro": {
             "roc_auc": float(np.mean(rocs)) if rocs else None,
@@ -204,13 +197,43 @@ def main() -> None:
         "per_pi": per_pi,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
-    res_path = out / f"auc_{args.name}.json"
+    res_path = out / f"auc_{name}.json"
     _write_json(res_path, result)
     print(f"[auc] POOLED roc_auc={roc} pr_auc={pr} "
           f"(baseline PR={y.mean():.4f}) "
           f"acc={result['pooled']['accuracy']:.4f} "
           f"(base {result['pooled']['accuracy_baseline_majoritaria']:.4f}) "
           f"-> {res_path}")
+    return result
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--ckpt", required=True, type=Path,
+                    help="state_dict (best_model_global.pth, best_local.pth…)")
+    ap.add_argument("--name", required=True,
+                    help="rótulo do experimento, ex.: fed_full_real, central_pi3")
+    ap.add_argument("--data-root", required=True, type=Path)
+    ap.add_argument("--pis", type=int, nargs="+", default=[1, 2, 3, 4, 5])
+    ap.add_argument("--max-shards", type=int, required=True,
+                    help="MESMO valor do run avaliado (15 nos runs completos)")
+    ap.add_argument("--max-windows", type=int, default=0)
+    ap.add_argument("--threshold", type=float, default=0.5,
+                    help="só para F1/precision/recall de referência")
+    ap.add_argument("--out-dir", type=Path, default=Path("auc_posthoc"))
+    ap.add_argument("--reuse", action="store_true")
+    args = ap.parse_args()
+
+    if not args.ckpt.exists():
+        raise SystemExit(f"[ERRO] checkpoint não existe: {args.ckpt}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = task.get_model(task.load_config(), device)
+    model.load_state_dict(torch.load(args.ckpt, map_location=device),
+                          strict=True)
+    avaliar(model, args.ckpt, args.name, args.data_root, device,
+            pis=args.pis, max_shards=args.max_shards,
+            max_windows=args.max_windows, threshold=args.threshold,
+            out_dir=args.out_dir, reuse=args.reuse)
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ Uso:
       --windows-root $REAL/02_windows/Hourly --pi 1 \
       --init-checkpoint $V0BOTH \
       --epochs 30 --patience 5 --max-shards 15 --tag pi1_esp_v0both \
-      --outdir /tmp/local_runs/real_synth \
+      --outdir ~/local_runs/real_synth \
       --cache-gb 8 --cache-dir /var/tmp/shard_cache
 
 Os shards NÃO ficam em subpasta por subconjunto: são arquivos soltos em
@@ -79,6 +79,36 @@ todos os países daquele setor.
 Saídas em <outdir>/<tag>/: best_local.pth, progress.json,
 confusion_matrix.json, confusion_matrix.png, metrics.json,
 history_<tag>.json, loss_<tag>.jsonl, summary_<tag>.json.
+
+==================== AUC-ROC COMPARÁVEL AO FEDERADO (NOVO) =================
+
+A avaliação antiga (mantida, marcada como "legado") NÃO serve para
+comparar com o federado nem para AUC:
+  * rótulo por JANELA, sem fusão: cada ponto entra em até F=24 janelas e é
+    contado até 24 vezes (daí os ~87 M "pontos");
+  * guarda só a predição binária (>0,5) — um ponto da curva ROC; a área
+    não pode ser reconstruída dele.
+
+Depois do treino, o script agora chama eval_auc.avaliar() — o MESMO
+código que avalia o best_model_global federado (task.evaluate: rótulos
+FUNDIDOS por prédio, score contínuo por ponto, amostragem linspace de
+--eval-max-shards shards de teste por partição). Saída em
+<outdir>/<tag>/auc/<tag>/, no formato do eval_auc.py (scores_pi<N>.npz,
+confusion_matrix_<tag>_pi<N>.json, auc_<tag>.json), lida diretamente por
+montar_resultados.py.
+
+Para comparar com o federado, --eval-pis e --eval-max-shards precisam ser
+os MESMOS do `smoke_test_fed.sh auc` dos checkpoints federados (padrão:
+pis 1..5, 15 shards). Avaliar os 5 Pis permite as duas visões: pooled dos
+5 e só o Pi1 (montar_resultados.py --pis 1), sem reavaliar.
+
+--eval-only: pula o treino e só refaz essa avaliação sobre o
+best_local.pth já gravado (ex.: a avaliação caiu depois de 72 h de treino;
+partições já concluídas são reaproveitadas pelo sha256 do checkpoint).
+
+PERSISTÊNCIA: --outdir em /tmp é recusado (use --allow-tmp para forçar).
+Foi assim que os checkpoints das execuções anteriores se perderam — e sem
+o checkpoint não há como calcular AUC depois.
 """
 from __future__ import annotations
 import argparse
@@ -110,6 +140,12 @@ def _add_repo_to_path(repo_dir: str | None) -> None:
     for c in candidatos:
         if (c / "step6_train.py").exists():
             sys.path.insert(0, str(c))
+            # NOVO: a raiz do repositório (onde vivem task.py e
+            # eval_auc.py, e de onde resolvem os imports `scripts.*`)
+            # também precisa estar no path para a avaliação comparável.
+            raiz = c.parent
+            if (raiz / "task.py").exists() and str(raiz) not in sys.path:
+                sys.path.insert(1, str(raiz))
             return
     raise FileNotFoundError(
         "step6_train.py não encontrado; use --repo-dir apontando para a "
@@ -409,7 +445,35 @@ def main() -> None:
     ap.add_argument("--outdir", type=Path, default=Path("./local_runs"))
     ap.add_argument("--repo-dir", type=str, default=None)
     ap.add_argument("--seed", type=int, default=42)
+    # ---------------- NOVO: avaliação comparável ao federado ----------------
+    ap.add_argument("--data-root", type=Path, default=None,
+                    help="raiz com 02_windows/ (o DATA_ROOT do federado). "
+                         "Padrão: dois níveis acima de --windows-root")
+    ap.add_argument("--eval-pis", type=int, nargs="+", default=[1, 2, 3, 4, 5],
+                    help="partições de TESTE avaliadas pelo protocolo "
+                         "federado (MESMAS do `auc` dos ckpts federados)")
+    ap.add_argument("--eval-max-shards", type=int, default=15,
+                    help="shards de teste por partição (MESMO MAX_SHARDS do "
+                         "`auc` dos ckpts federados)")
+    ap.add_argument("--eval-max-windows", type=int, default=0)
+    ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument("--eval-only", action="store_true",
+                    help="não treina: só avalia <outdir>/<tag>/best_local.pth "
+                         "pelo protocolo federado (reaproveita partições já "
+                         "avaliadas com o mesmo checkpoint)")
+    ap.add_argument("--allow-tmp", action="store_true",
+                    help="permite --outdir em /tmp (NÃO recomendado)")
     a = ap.parse_args()
+
+    # /tmp é apagado no reboot: foi onde os checkpoints anteriores sumiram.
+    a.outdir = a.outdir.expanduser()
+    out_abs = a.outdir.resolve()
+    if not a.allow_tmp and any(str(out_abs) == d or str(out_abs).startswith(d + "/")
+                               for d in ("/tmp", "/dev/shm", "/run")):
+        raise SystemExit(
+            f"[ERRO] --outdir {out_abs} é volátil (apagado no reboot) — o "
+            f"best_local.pth é necessário para calcular AUC. Use um caminho "
+            f"persistente (ex.: ~/local_runs ou o NAS) ou --allow-tmp.")
 
     _add_repo_to_path(a.repo_dir)
     import numpy as np
@@ -421,6 +485,18 @@ def main() -> None:
     from model_hybrid import HybridWLSTMix
     from scripts.config import CFG
     from fed_monitor import RunMonitor
+    import eval_auc                                   # NOVO: mesmo código do federado
+
+    # A avaliação comparável lê <data_root>/02_windows/<CFG.resolution>/test
+    # (task._load_local). Precisa ser a MESMA árvore do --windows-root, senão
+    # o treino e a avaliação estariam olhando para dados diferentes.
+    data_root = a.data_root or a.windows_root.parent.parent
+    esperado = (data_root / "02_windows" / CFG.resolution).resolve()
+    if esperado != a.windows_root.resolve():
+        raise SystemExit(
+            f"[ERRO] --windows-root {a.windows_root.resolve()} != "
+            f"<data-root>/02_windows/{CFG.resolution} = {esperado}. "
+            f"Passe --data-root explicitamente.")
 
     if a.threads > 0:
         torch.set_num_threads(a.threads)
@@ -432,6 +508,32 @@ def main() -> None:
     torch.manual_seed(a.seed)
     print(f"[local] threads torch={torch.get_num_threads()} | batch={bs} | "
           f"val-mode={a.val_mode}")
+
+    def _avaliar_protocolo_federado(model) -> dict:
+        """AUC-ROC/PR-AUC + matriz pooled pelo MESMO task.evaluate do
+        federado, sobre o best_local.pth (o sha256 dele vai no resultado)."""
+        ckpt = out / "best_local.pth"
+        if not ckpt.exists():
+            # sem best: avalia os pesos em memória, mas grava-os antes para
+            # que o sha256 identifique exatamente o que foi avaliado
+            ckpt = out / "last_local.pth"
+            torch.save(model.state_dict(), ckpt)
+        print(f"[local] avaliação comparável ao federado: pis={a.eval_pis} "
+              f"max_shards={a.eval_max_shards} data_root={data_root}")
+        return eval_auc.avaliar(
+            model, ckpt, a.tag, data_root, device,
+            pis=a.eval_pis, max_shards=a.eval_max_shards,
+            max_windows=a.eval_max_windows, threshold=a.threshold,
+            out_dir=out / "auc", reuse=True)
+
+    if a.eval_only:
+        ckpt = out / "best_local.pth"
+        if not ckpt.exists():
+            raise SystemExit(f"[ERRO] --eval-only sem {ckpt}")
+        model = HybridWLSTMix(device).to(device)
+        model.load_state_dict(torch.load(ckpt, map_location=device), strict=True)
+        _avaliar_protocolo_federado(model)
+        return
 
     # ---------------- modelo + checkpoint inicial (strict) ----------------
     model = HybridWLSTMix(device).to(device)
@@ -598,6 +700,9 @@ def main() -> None:
     f1 = 2 * precision * recall / max(precision + recall, 1e-12)
     resumo_mon = mon.summary()
     cm = {"tag": a.tag, "init_checkpoint": str(a.init_checkpoint),
+          # NOVO: deixa explícito que estas contagens NÃO são comparáveis ao
+          # federado (ver docstring); as comparáveis ficam em auc/<tag>/.
+          "protocolo_teste": "legado_por_janela_sem_fusao",
           "TP": tp, "TN": tn, "FP": fp, "FN": fn, "total_pontos": total,
           "precision": round(precision, 6), "recall": round(recall, 6),
           "f1": round(f1, 6),
@@ -642,6 +747,30 @@ def main() -> None:
         print(f"[local] matriz salva em {out/'confusion_matrix.png'}")
     except ImportError:
         print("[local] matplotlib ausente — só o JSON foi gerado")
+
+    # ------- NOVO: avaliação COMPARÁVEL ao federado (AUC-ROC pooled) -------
+    # Roda por último: se cair, treino e avaliação legada já estão salvos e
+    # basta repetir o comando com --eval-only.
+    t_auc = time.time()
+    res = _avaliar_protocolo_federado(model)
+    seg_auc = time.time() - t_auc
+    pooled = res["pooled"]
+    cm["protocolo_federado"] = {
+        "pasta": str(out / "auc" / a.tag),
+        "ckpt_sha256": res["ckpt_sha256"],
+        "pis": res["pis"], "max_shards": res["max_shards"],
+        "roc_auc_pooled": pooled["roc_auc"], "pr_auc_pooled": pooled["pr_auc"],
+        "recall_pooled": pooled["recall"], "accuracy_pooled": pooled["accuracy"],
+        "n_pontos": pooled["n_pontos"],
+        "roc_auc_por_pi": {k: v["roc_auc"] for k, v in res["per_pi"].items()},
+        "wall_time_s": round(seg_auc, 1)}
+    _atomic_json(out / "confusion_matrix.json", cm)
+    _atomic_json(out / "metrics.json",
+                 {**cm, "melhor_val_treino": best, "historico": historico,
+                  "run_monitor": resumo_mon})
+    print(f"[local] AUC-ROC pooled (protocolo federado) = {pooled['roc_auc']} "
+          f"| recall = {pooled['recall']:.4f} | n = {pooled['n_pontos']:,} "
+          f"-> {out / 'auc' / a.tag}")
 
 
 if __name__ == "__main__":
