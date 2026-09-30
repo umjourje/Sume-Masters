@@ -89,7 +89,8 @@ comparar com o federado nem para AUC:
   * guarda só a predição binária (>0,5) — um ponto da curva ROC; a área
     não pode ser reconstruída dele.
 
-Depois do treino, o script agora chama eval_auc.avaliar() — o MESMO
+Depois do treino, o script agora faz a AVALIAÇÃO PADRONIZADA do modelo
+CENTRALIZADO: chama eval_auc.avaliar() — o MESMO
 código que avalia o best_model_global federado (task.evaluate: rótulos
 FUNDIDOS por prédio, score contínuo por ponto, amostragem linspace de
 --eval-max-shards shards de teste por partição). Saída em
@@ -459,7 +460,7 @@ def main() -> None:
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--eval-only", action="store_true",
                     help="não treina: só avalia <outdir>/<tag>/best_local.pth "
-                         "pelo protocolo federado (reaproveita partições já "
+                         "pela avaliação padronizada (reaproveita partições já "
                          "avaliadas com o mesmo checkpoint)")
     ap.add_argument("--allow-tmp", action="store_true",
                     help="permite --outdir em /tmp (NÃO recomendado)")
@@ -509,7 +510,7 @@ def main() -> None:
     print(f"[local] threads torch={torch.get_num_threads()} | batch={bs} | "
           f"val-mode={a.val_mode}")
 
-    def _avaliar_protocolo_federado(model) -> dict:
+    def _avaliacao_padronizada(model) -> dict:
         """AUC-ROC/PR-AUC + matriz pooled pelo MESMO task.evaluate do
         federado, sobre o best_local.pth (o sha256 dele vai no resultado)."""
         ckpt = out / "best_local.pth"
@@ -518,7 +519,8 @@ def main() -> None:
             # que o sha256 identifique exatamente o que foi avaliado
             ckpt = out / "last_local.pth"
             torch.save(model.state_dict(), ckpt)
-        print(f"[local] avaliação comparável ao federado: pis={a.eval_pis} "
+        print(f"[local] MODELO CENTRALIZADO ({a.tag}) — avaliação padronizada "
+              f"(mesmo task.evaluate do federado): pis={a.eval_pis} "
               f"max_shards={a.eval_max_shards} data_root={data_root}")
         return eval_auc.avaliar(
             model, ckpt, a.tag, data_root, device,
@@ -532,7 +534,7 @@ def main() -> None:
             raise SystemExit(f"[ERRO] --eval-only sem {ckpt}")
         model = HybridWLSTMix(device).to(device)
         model.load_state_dict(torch.load(ckpt, map_location=device), strict=True)
-        _avaliar_protocolo_federado(model)
+        _avaliacao_padronizada(model)
         return
 
     # ---------------- modelo + checkpoint inicial (strict) ----------------
@@ -752,10 +754,10 @@ def main() -> None:
     # Roda por último: se cair, treino e avaliação legada já estão salvos e
     # basta repetir o comando com --eval-only.
     t_auc = time.time()
-    res = _avaliar_protocolo_federado(model)
+    res = _avaliacao_padronizada(model)
     seg_auc = time.time() - t_auc
     pooled = res["pooled"]
-    cm["protocolo_federado"] = {
+    cm["avaliacao_padronizada"] = {
         "pasta": str(out / "auc" / a.tag),
         "ckpt_sha256": res["ckpt_sha256"],
         "pis": res["pis"], "max_shards": res["max_shards"],
@@ -768,7 +770,8 @@ def main() -> None:
     _atomic_json(out / "metrics.json",
                  {**cm, "melhor_val_treino": best, "historico": historico,
                   "run_monitor": resumo_mon})
-    print(f"[local] AUC-ROC pooled (protocolo federado) = {pooled['roc_auc']} "
+    print(f"[local] MODELO CENTRALIZADO ({a.tag}) — AUC-ROC pooled "
+          f"(avaliação padronizada) = {pooled['roc_auc']} "
           f"| recall = {pooled['recall']:.4f} | n = {pooled['n_pontos']:,} "
           f"-> {out / 'auc' / a.tag}")
 
