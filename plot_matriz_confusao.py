@@ -40,10 +40,11 @@ def plot_confusion_matrix_from_dict(data,
     accuracy = data.get('accuracy', np.trace(cf) / float(np.sum(cf)))
     recall = data.get('recall', cf[1, 1] / sum(cf[1, :]))
     aucroc = data.get('aucroc')
+    anomalias = data.get('taxa_anomalia_teste')
     # precision = data.get('precision', cf[1, 1] / sum(cf[:, 1]))
     # f1_score = data.get('f1', 2 * (precision * recall) / (precision + recall))
 
-    stats_text = (f"\n\nAcurácia={accuracy:0.3f}\n"
+    stats_text = (f"\n\nTaxa de Anomalias={anomalias:0.3f}\n"
                   f"Recall={recall:0.3f}\n"
                   f"AUC-ROC Score={aucroc:0.3f}\n")
     #              f"Precisão={precision:0.3f}\n"
